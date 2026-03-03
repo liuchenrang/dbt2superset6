@@ -206,14 +206,14 @@ class DbtToSuperset:
             "charts": [],
         }
 
-        exposure_meta = exposure.get("meta", {})
+        exposure_meta = exposure.get("meta", {}) or {}
 
         # 从meta中获取charts配置
-        if "charts" in exposure_meta:
-            for chart_config in exposure_meta["charts"]:
-                chart = self._create_chart_config(chart_config, model_metas)
-                if chart:
-                    dashboard_config["charts"].append(chart)
+        charts_config = exposure_meta.get("charts") or []
+        for chart_config in charts_config:
+            chart = self._create_chart_config(chart_config, model_metas)
+            if chart:
+                dashboard_config["charts"].append(chart)
 
         return dashboard_config
 
