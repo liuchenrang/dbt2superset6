@@ -10,6 +10,9 @@
     推送时解析ligthdash语法，及dbt语法。 推送到supperset 项目
 实现pull命令
     拉取superset定义的面板转换成exposures，及superset的里定义的数据集传model的定义， model的定义使用lightdash语法
+
+push时，创建datasets,给字段添加描述，及指标。pull时，能根据supserset，如果本地没有存在对应的模型yml文件要反向根据dbt和lightdash文档创建模型yml    
+
 推送时
 ```yml
 metrics: 定义里面的都是指标
@@ -29,6 +32,9 @@ superset项目
  - 面板api https://superset.apache.org/developer-docs/api/dashboards 
 dbt 
 - https://docs.getdbt.com/docs/build/exposures 
+- https://docs.getdbt.com/docs/build/enhance-your-models
+- https://docs.getdbt.com/docs/build/models
 ligthdash
 - 指标语法 
   https://docs.lightdash.com/get-started/develop-in-lightdash/how-to-create-metrics
+

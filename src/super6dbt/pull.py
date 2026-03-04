@@ -55,15 +55,23 @@ class SupersetPuller:
         # 5. 更新模型的meta信息
         self._update_model_meta()
 
+        # 6. 为缺失 schema.yml 的模型生成 schema 文件
+        self._generate_missing_schemas()
+
         logger.info(f"成功拉取 {len(exposures)} 个exposures")
 
     def _load_datasets(self) -> None:
-        """加载数据集映射"""
+        """加载数据集映射（包含完整列信息）"""
         datasets = self.client.get_datasets()
         logger.info(f"加载 {len(datasets)} 个数据集")
 
         for dataset in datasets:
-            self.dataset_map[dataset["id"]] = dataset
+            dataset_id = dataset.get("id")
+            if dataset_id:
+                # 获取完整的数据集信息（包含列信息）
+                full_dataset = self.client.get_dataset(dataset_id)
+                if full_dataset:
+                    self.dataset_map[dataset_id] = full_dataset
 
     def _write_exposures(self, exposures: List[Dict[str, Any]]) -> None:
         """写入exposures YAML文件"""
@@ -125,7 +133,10 @@ class SupersetPuller:
     def _update_schema_file(
         self, schema_file: Path, dataset_meta_map: Dict[str, Dict[str, Any]]
     ) -> None:
-        """更新单个schema文件 - 初始化或更新模型的 meta 配置"""
+        """更新单个schema文件 - 初始化或更新模型的 meta 配置
+
+        保留 computed_columns 和 x-metric-definitions 字段，确保计算列同步
+        """
         try:
             with open(schema_file, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -139,12 +150,20 @@ class SupersetPuller:
             if not models:
                 return
 
+            # 保留现有的 computed_columns 和 x-metric-definitions
+            existing_computed_columns_map = {}
+            existing_metric_definitions = data.get("x-metric-definitions", {})
+
             # 更新每个model的meta信息
             updated = False
             for model in models:
                 model_name = model.get("name")
                 if model_name in dataset_meta_map:
                     dataset_meta = dataset_meta_map[model_name]
+
+                    # 保留现有的 computed_columns
+                    if "computed_columns" in model:
+                        existing_computed_columns_map[model_name] = model["computed_columns"]
 
                     # 确保columns存在
                     if "columns" not in model:
@@ -212,6 +231,16 @@ class SupersetPuller:
                     updated = True
 
             if updated:
+                # 恢复 computed_columns
+                for model in models:
+                    model_name = model.get("name")
+                    if model_name in existing_computed_columns_map:
+                        model["computed_columns"] = existing_computed_columns_map[model_name]
+
+                # 恢复 x-metric-definitions（如果存在）
+                if existing_metric_definitions:
+                    data["x-metric-definitions"] = existing_metric_definitions
+
                 # 写回文件，保持原有格式
                 with open(schema_file, "w", encoding="utf-8") as f:
                     yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False, indent=2)
@@ -220,3 +249,78 @@ class SupersetPuller:
 
         except Exception as e:
             logger.error(f"更新schema文件失败 {schema_file}: {e}")
+
+    def _generate_missing_schemas(self) -> None:
+        """为缺失 schema.yml 的模型生成 schema 文件
+
+        当本地有 SQL 模型文件但没有对应的 schema.yml 文件时，
+        根据 Superset 数据集信息反向生成 schema.yml
+        """
+        model_paths = self.dbt_config.full_model_paths
+
+        # 查找所有 SQL 模型文件
+        sql_models = []
+        for model_path in model_paths:
+            for sql_file in model_path.glob("**/*.sql"):
+                # 获取模型名（不含路径和扩展名）
+                model_name = sql_file.stem
+                sql_models.append((model_name, sql_file))
+
+        logger.info(f"找到 {len(sql_models)} 个 SQL 模型文件")
+
+        # 查找所有现有的 schema.yml 文件中的模型
+        existing_models = set()
+        schema_files = []
+        for model_path in model_paths:
+            for pattern in ["**/*.yml", "**/*.yaml"]:
+                for file_path in model_path.glob(pattern):
+                    if file_path.exists():
+                        try:
+                            with open(file_path, "r", encoding="utf-8") as f:
+                                content = f.read()
+                            if content.strip() and "models:" in content:
+                                data = yaml.safe_load(content) or {}
+                                for model in data.get("models", []):
+                                    existing_models.add(model.get("name"))
+                                schema_files.append(file_path)
+                        except Exception:
+                            pass
+
+        logger.info(f"找到 {len(existing_models)} 个已有 schema 的模型")
+
+        # 找出缺失 schema 的模型
+        missing_models = [
+            (name, path) for name, path in sql_models
+            if name not in existing_models
+        ]
+
+        if not missing_models:
+            logger.info("所有模型都有对应的 schema.yml 文件")
+            return
+
+        logger.info(f"发现 {len(missing_models)} 个缺失 schema 的模型")
+
+        # 为每个缺失的模型生成 schema
+        for model_name, sql_file in missing_models:
+            # 在 Superset 数据集中查找对应的数据集
+            dataset = None
+            for ds in self.dataset_map.values():
+                if ds.get("table_name") == model_name:
+                    dataset = ds
+                    break
+
+            if not dataset:
+                logger.warning(f"未找到模型 {model_name} 对应的 Superset 数据集，跳过")
+                continue
+
+            # 生成 schema 内容（使用支持计算列的方法）
+            yaml_content = self.mapper.generate_yaml_schema_with_computed(dataset)
+
+            # schema.yml 文件路径（与 SQL 文件同目录）
+            schema_file = sql_file.with_suffix(".yml")
+
+            # 写入文件
+            with open(schema_file, "w", encoding="utf-8") as f:
+                f.write(yaml_content)
+
+            logger.info(f"为模型 {model_name} 生成 schema 文件: {schema_file}")

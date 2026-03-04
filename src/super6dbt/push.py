@@ -635,14 +635,15 @@ class SupersetPusher:
         logger.warning(f"未找到exposure文件: {exposure_name}.yml")
 
     def _sync_dataset_metrics(self) -> None:
-        """同步 dbt model 中定义的指标到 Superset 数据集
+        """同步 dbt model 中定义的列描述和指标到 Superset 数据集
 
         根据 dbt model 的 meta.metrics 定义，更新 Superset 数据集的 metrics 字段
+        根据 dbt model 的 columns.description，更新 Superset 数据集的 columns 字段
         如果数据集不存在，则自动创建
         """
         from .mapper import METRIC_TYPE_TO_SUPERSET_AGG
 
-        logger.info("开始同步数据集指标...")
+        logger.info("开始同步数据集列描述和指标...")
 
         for model_name, model_meta in self.mapper.models.items():
             # 获取或创建 Superset 数据集
@@ -653,6 +654,7 @@ class SupersetPusher:
 
             dataset_id = dataset.get("id")
             existing_metrics = {m.get("metric_name"): m for m in dataset.get("metrics", [])}
+            existing_columns = {c.get("column_name"): c for c in dataset.get("columns", [])}
 
             # 构建新的指标列表
             new_metrics = []
@@ -710,10 +712,10 @@ class SupersetPusher:
             if metrics_to_add:
                 new_metrics.extend(metrics_to_add)
 
-                # 调用 API 更新数据集
-                self._update_dataset_metrics(dataset_id, new_metrics)
+                # 调用 API 更新数据集指标和列描述
+                self._update_dataset_with_metrics_and_columns(dataset_id, new_metrics, model_meta, existing_columns)
 
-                logger.info(f"数据集 {model_name} (ID: {dataset_id}) 同步了 {len(metrics_to_add)} 个指标")
+                logger.info(f"数据集 {model_name} (ID: {dataset_id}) 同步了 {len(metrics_to_add)} 个指标和列描述")
 
     def _update_dataset_metrics(self, dataset_id: int, metrics: List[Dict[str, Any]]) -> bool:
         """更新数据集的指标定义
@@ -768,4 +770,135 @@ class SupersetPusher:
             return True
         else:
             logger.error(f"更新数据集指标失败: {response.status_code} - {response.text[:200]}")
+            return False
+
+    def _update_dataset_with_metrics_and_columns(
+        self,
+        dataset_id: int,
+        metrics: List[Dict[str, Any]],
+        model_meta: "ModelMeta",
+        existing_columns: Dict[str, Dict[str, Any]]
+    ) -> bool:
+        """更新数据集的指标定义和列描述（支持计算列）
+
+        Args:
+            dataset_id: 数据集 ID
+            metrics: 指标列表
+            model_meta: dbt 模型元数据（包含列描述）
+            existing_columns: 现有列信息
+
+        Returns:
+            是否更新成功
+        """
+        import json
+        import base64
+
+        # 获取 CSRF token
+        csrf_resp = self.client._request("GET", "/api/v1/security/csrf_token/")
+        if csrf_resp.status_code == 200:
+            csrf_token = csrf_resp.json().get("result")
+            if csrf_token:
+                self.client.csrf_token = csrf_token
+
+        # 清理指标对象，只保留必要字段
+        clean_metrics = []
+        for m in metrics:
+            clean_m = {
+                "metric_name": m.get("metric_name"),
+                "verbose_name": m.get("verbose_name"),
+                "expression": m.get("expression"),
+            }
+            # 可选字段
+            if m.get("description"):
+                clean_m["description"] = m.get("description")
+            if m.get("id"):
+                clean_m["id"] = m.get("id")
+            if m.get("uuid"):
+                clean_m["uuid"] = m.get("uuid")
+            clean_metrics.append(clean_m)
+
+        # 识别计算列
+        calculated_columns = self.mapper.identify_calculated_columns(model_meta)
+        calculated_names = {c["column_name"] for c in calculated_columns}
+
+        # 构建 columns 信息（区分物理列和计算列）
+        clean_columns = []
+        for col_name, col_meta in model_meta.columns.items():
+            # 如果是计算列，则跳过（后续单独处理）
+            if col_name in calculated_names:
+                continue
+
+            col_obj = {}
+
+            # 从现有列中保留必要字段（包含 id）
+            if col_name in existing_columns:
+                existing_col = existing_columns[col_name]
+                if not existing_col.get("expression"):  # 只处理物理列
+                    col_obj["id"] = existing_col.get("id")
+                    if "type" in existing_col:
+                        col_obj["type"] = existing_col["type"]
+                    if "is_dttm" in existing_col:
+                        col_obj["is_dttm"] = existing_col["is_dttm"]
+                    if "filterable" in existing_col:
+                        col_obj["filterable"] = existing_col["filterable"]
+
+            col_obj["column_name"] = col_name
+
+            # 使用列的 description 作为 verbose_name
+            if col_meta.description:
+                col_obj["description"] = col_meta.description
+                col_obj["verbose_name"] = col_meta.description
+
+            # 从 meta.dimension.label 获取（如果存在）
+            if col_meta.dimensions and col_meta.dimensions.get("label"):
+                col_obj["verbose_name"] = col_meta.dimensions["label"]
+
+            clean_columns.append(col_obj)
+
+        # 添加计算列
+        for calc in calculated_columns:
+            col_name = calc["column_name"]
+            expression = calc["expression"]
+            col_type = calc["type"]
+            col_description = calc["description"]
+            verbose_name = calc["verbose_name"]
+
+            col_obj = {
+                "column_name": col_name,
+                "expression": expression,
+                "type": col_type,
+                "description": col_description,
+                "verbose_name": verbose_name,
+                "is_dttm": False,
+                "filterable": True,
+                "groupby": True,
+                "is_active": True
+            }
+
+            # 保留现有 ID（如果存在）
+            if col_name in existing_columns:
+                existing_col = existing_columns[col_name]
+                if existing_col.get("expression"):  # 这是一个现有计算列
+                    col_obj["id"] = existing_col.get("id")
+
+            clean_columns.append(col_obj)
+
+        # 构建更新 payload（包含 description、metrics 和 columns）
+        payload = {
+            "description": model_meta.description,
+            "metrics": clean_metrics,
+            "columns": clean_columns
+        }
+
+        response = self.client._request(
+            "PUT",
+            f"/api/v1/dataset/{dataset_id}",
+            json=payload
+        )
+
+        if response.status_code == 200:
+            logger.debug(f"更新数据集指标、列描述和计算列成功: {dataset_id}")
+            return True
+        else:
+            logger.error(f"更新数据集失败: {response.status_code} - {response.text[:200]}")
             return False
