@@ -4,12 +4,46 @@ from pathlib import Path
 from typing import Dict, Any, List
 import yaml
 import logging
+import re
 
 from .client import SupersetClient
 from .mapper import SupersetToDbt
 from .config import DbtProjectConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_model_name(table_name: str) -> str:
+    """清洗表名，使其可以作为文件名/目录名使用
+
+    替换非法字符：
+    - /, \\ -> _
+    - : -> _
+    - * -> _
+    - ? -> _
+    - " -> _
+    - <, > -> _
+    - | -> _
+
+    保留：字母、数字、下划线、中划线、点、中文等
+    """
+    if not table_name:
+        return "unnamed"
+
+    # 替换文件系统非法字符为下划线
+    sanitized = re.sub(r'[\\/:*?"<>|]', '_', table_name)
+
+    # 移除连续的下划线
+    sanitized = re.sub(r'_+', '_', sanitized)
+
+    # 移除首尾的下划线和点
+    sanitized = sanitized.strip('._')
+
+    # 如果为空，返回默认值
+    if not sanitized:
+        return "unnamed_model"
+
+    return sanitized
 
 
 class SupersetPuller:
@@ -251,26 +285,31 @@ class SupersetPuller:
             logger.error(f"更新schema文件失败 {schema_file}: {e}")
 
     def _generate_missing_schemas(self) -> None:
-        """为缺失 schema.yml 的模型生成 schema 文件
+        """为 Superset 数据集生成对应的模型 schema 文件
 
-        当本地有 SQL 模型文件但没有对应的 schema.yml 文件时，
-        根据 Superset 数据集信息反向生成 schema.yml
+        规则：
+        1. 如果项目下没有对应的模型 SQL 文件 → 在第一个 model-paths 下创建同名目录（清洗后的目录名），生成 sanitized_name/sanitized_name.yml
+        2. 如果发现存在模型 SQL 文件（如 xx/yy/top.sql）→ 在同目录下生成 xx/yy/top.yml
+
+        注意：目录名/文件名会清洗非法字符，但 YAML 中的 model.name 保持原始表名
         """
         model_paths = self.dbt_config.full_model_paths
 
-        # 查找所有 SQL 模型文件
-        sql_models = []
+        if not model_paths:
+            logger.error("没有配置模型路径")
+            return
+
+        # 扫描所有 SQL 模型文件，建立模型名到 SQL 文件路径的映射
+        sql_model_map = {}
         for model_path in model_paths:
             for sql_file in model_path.glob("**/*.sql"):
-                # 获取模型名（不含路径和扩展名）
                 model_name = sql_file.stem
-                sql_models.append((model_name, sql_file))
+                sql_model_map[model_name] = sql_file
 
-        logger.info(f"找到 {len(sql_models)} 个 SQL 模型文件")
+        logger.info(f"找到 {len(sql_model_map)} 个 SQL 模型文件")
 
         # 查找所有现有的 schema.yml 文件中的模型
         existing_models = set()
-        schema_files = []
         for model_path in model_paths:
             for pattern in ["**/*.yml", "**/*.yaml"]:
                 for file_path in model_path.glob(pattern):
@@ -282,45 +321,46 @@ class SupersetPuller:
                                 data = yaml.safe_load(content) or {}
                                 for model in data.get("models", []):
                                     existing_models.add(model.get("name"))
-                                schema_files.append(file_path)
                         except Exception:
                             pass
 
         logger.info(f"找到 {len(existing_models)} 个已有 schema 的模型")
 
-        # 找出缺失 schema 的模型
-        missing_models = [
-            (name, path) for name, path in sql_models
-            if name not in existing_models
-        ]
-
-        if not missing_models:
-            logger.info("所有模型都有对应的 schema.yml 文件")
-            return
-
-        logger.info(f"发现 {len(missing_models)} 个缺失 schema 的模型")
-
-        # 为每个缺失的模型生成 schema
-        for model_name, sql_file in missing_models:
-            # 在 Superset 数据集中查找对应的数据集
-            dataset = None
-            for ds in self.dataset_map.values():
-                if ds.get("table_name") == model_name:
-                    dataset = ds
-                    break
-
-            if not dataset:
-                logger.warning(f"未找到模型 {model_name} 对应的 Superset 数据集，跳过")
+        # 为每个数据集生成 schema 文件
+        base_model_path = model_paths[0]
+        generated_count = 0
+        for dataset in self.dataset_map.values():
+            table_name = dataset.get("table_name")
+            if not table_name:
                 continue
 
-            # 生成 schema 内容（使用支持计算列的方法）
+            # 如果该模型已有 schema，跳过
+            if table_name in existing_models:
+                logger.debug(f"模型 {table_name} 已有 schema，跳过")
+                continue
+
+            # 生成 schema 内容（YAML 中的 name 保持原始表名）
             yaml_content = self.mapper.generate_yaml_schema_with_computed(dataset)
 
-            # schema.yml 文件路径（与 SQL 文件同目录）
-            schema_file = sql_file.with_suffix(".yml")
+            # 判断是否存在对应的 SQL 文件
+            if table_name in sql_model_map:
+                # 情况2: 存在 SQL 文件，在同目录下生成同名 yml
+                sql_file = sql_model_map[table_name]
+                schema_file = sql_file.with_suffix(".yml")
+                logger.info(f"为数据集 {table_name} 生成 schema 文件 (与 SQL 同目录): {schema_file}")
+            else:
+                # 情况1: 不存在 SQL 文件，在第一个 model-paths 下创建同名目录
+                # 清洗表名作为目录名（替换非法字符）
+                sanitized_name = _sanitize_model_name(table_name)
+                model_dir = base_model_path / sanitized_name
+                model_dir.mkdir(parents=True, exist_ok=True)
+                schema_file = model_dir / f"{sanitized_name}.yml"
+                logger.info(f"为数据集 {table_name} 生成 schema 文件 (新目录): {schema_file}")
 
             # 写入文件
             with open(schema_file, "w", encoding="utf-8") as f:
                 f.write(yaml_content)
 
-            logger.info(f"为模型 {model_name} 生成 schema 文件: {schema_file}")
+            generated_count += 1
+
+        logger.info(f"成功生成 {generated_count} 个新的 schema 文件")

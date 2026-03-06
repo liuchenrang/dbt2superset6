@@ -50,11 +50,19 @@ super6dbt init
 
 ```yaml
 superset:
+  # Superset基础URL
   base_url: "http://localhost:8088"
+
+  # 登录凭证
   username: "admin"
   password: "admin"
   provider: "db"
+
+  # SSL验证
   verify_ssl: false
+
+  # 数据库名称（可选，用于创建数据集）
+  database: "your_database_name"
 ```
 
 ## 使用方法
@@ -91,6 +99,18 @@ super6dbt push
 
 ```bash
 super6dbt push --exposure-names my_dashboard
+```
+
+仅推送指定 model 的数据集（不创建面板）：
+
+```bash
+super6dbt push --model-names orders,products
+```
+
+推送指定 model 的数据集，指定 schema：
+
+```bash
+super6dbt push --model-names ads_channel_conversion_analysis_full --schema wa_ads
 ```
 
 ## dbt 模型定义

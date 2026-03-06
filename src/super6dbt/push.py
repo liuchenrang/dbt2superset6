@@ -25,19 +25,27 @@ class SupersetPusher:
         self.dbt_config = dbt_config
         self.mapper = DbtToSuperset()
 
-    def push(self, exposure_names: List[str] = None) -> None:
+    def push(self, exposure_names: List[str] = None, model_names: List[str] = None, schema: str = None) -> None:
         """推送配置
 
         Args:
             exposure_names: 要推送的exposure名称列表，None表示推送所有
+            model_names: 要推送的model名称列表（仅同步数据集），None表示不限制
+            schema: 指定数据集的 schema 名称（优先级最高）
         """
         logger.info("开始推送配置到Superset...")
 
         # 1. 加载所有models的meta信息
-        self._load_models()
+        self._load_models(model_names)
 
         # 2. 同步数据集指标到 Superset
-        self._sync_dataset_metrics()
+        self._sync_dataset_metrics(model_names, schema)
+
+        # 如果指定了 model_names，只同步数据集，不处理 exposures
+        if model_names:
+            logger.info(f"仅同步数据集: {', '.join(model_names)}")
+            logger.info("推送完成")
+            return
 
         # 3. 加载exposures
         exposures = self._load_exposures()
@@ -63,23 +71,57 @@ class SupersetPusher:
 
         # 5. 为每个exposure创建或更新面板
         for exposure in exposures:
-            self._sync_exposure(exposure, owner_id)
+            self._sync_exposure(exposure, owner_id, schema)
 
         logger.info("推送完成")
 
-    def _load_models(self) -> None:
-        """加载所有models的meta配置"""
+    def _load_models(self, model_names: List[str] = None) -> None:
+        """加载所有models的meta配置
+
+        Args:
+            model_names: 要加载的模型名称列表，None表示加载所有
+        """
         model_paths = self.dbt_config.full_model_paths
 
         for model_path in model_paths:
             for pattern in ["**/*.yml", "**/*.yaml"]:
                 for file_path in model_path.glob(pattern):
-                    self._parse_model_file(file_path)
+                    self._parse_model_file(file_path, model_names)
+
+        # 如果指定了模型名称，只保留指定的模型
+        if model_names:
+            filtered_models = {
+                name: meta for name, meta in self.mapper.models.items()
+                if name in model_names
+            }
+            self.mapper.models = filtered_models
 
         logger.info(f"加载了 {len(self.mapper.models)} 个模型")
 
-    def _parse_model_file(self, file_path: Path) -> None:
-        """解析单个model文件"""
+    def _parse_model_file(self, file_path: Path, model_names: List[str] = None) -> None:
+        """解析单个model文件
+
+        Args:
+            file_path: 文件路径
+            model_names: 要加载的模型名称列表，None表示加载所有
+
+        优化：如果指定了 model_names，且文件名不匹配任何模型名，则跳过解析
+        """
+        # 如果指定了模型名称，先检查文件名是否可能包含指定的模型
+        if model_names:
+            # 获取文件名（不含路径和扩展名）
+            file_stem = file_path.stem
+            # 检查文件名是否匹配任何指定的模型名
+            file_matches = any(
+                model_name == file_stem or model_name.replace("_", "-") == file_stem
+                for model_name in model_names
+            )
+            # 如果不匹配，跳过此文件（但只优化，仍然尝试解析以防万一）
+            if not file_matches:
+                # 可以在这里跳过，但为了保险起见，仍然解析文件
+                # 因为有些情况下文件名可能不完全匹配
+                pass
+
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
@@ -91,11 +133,16 @@ class SupersetPusher:
             for model in models:
                 model_name = model.get("name")
                 if model_name:
+                    # 如果指定了模型名称，只加载指定的模型
+                    if model_names and model_name not in model_names:
+                        continue
                     model_meta = self.mapper.parse_model_meta(model_name, model)
                     self.mapper.models[model_name] = model_meta
 
         except Exception as e:
-            logger.error(f"解析模型文件失败 {file_path}: {e}")
+            # 只在可能相关的文件上显示错误
+            if model_names is None or any(name in str(file_path) for name in model_names):
+                logger.error(f"解析模型文件失败 {file_path}: {e}")
 
     def _load_exposures(self) -> List[Dict[str, Any]]:
         """加载exposures配置"""
@@ -127,8 +174,14 @@ class SupersetPusher:
             logger.error(f"解析exposure文件失败 {file_path}: {e}")
             return []
 
-    def _sync_exposure(self, exposure: Dict[str, Any], owner_id: int) -> None:
-        """同步单个exposure到Superset"""
+    def _sync_exposure(self, exposure: Dict[str, Any], owner_id: int, schema: str = None) -> None:
+        """同步单个exposure到Superset
+
+        Args:
+            exposure: exposure配置
+            owner_id: 面板拥有者ID
+            schema: 指定数据集的 schema 名称（优先级最高）
+        """
         exposure_name = exposure.get("name")
         exposure_meta = exposure.get("meta", {})
 
@@ -152,7 +205,7 @@ class SupersetPusher:
 
         # 同步图表
         if exposure_meta.get("dashboard_id"):
-            self._sync_charts(exposure, exposure_meta["dashboard_id"])
+            self._sync_charts(exposure, exposure_meta["dashboard_id"], schema)
 
     def _create_dashboard(
         self, dashboard_config: Dict[str, Any], owner_id: int
@@ -186,8 +239,14 @@ class SupersetPusher:
         else:
             logger.warning(f"更新面板失败: ID {dashboard_id}")
 
-    def _sync_charts(self, exposure: Dict[str, Any], dashboard_id: int) -> None:
-        """同步图表到面板 - 包括创建/更新图表并将其关联到面板"""
+    def _sync_charts(self, exposure: Dict[str, Any], dashboard_id: int, schema: str = None) -> None:
+        """同步图表到面板 - 包括创建/更新图表并将其关联到面板
+
+        Args:
+            exposure: exposure配置
+            dashboard_id: 面板ID
+            schema: 指定数据集的 schema 名称（优先级最高）
+        """
         exposure_meta = exposure.get("meta", {})
         charts_config = exposure_meta.get("charts", [])
         existing_charts_map = exposure_meta.get("existing_charts", {})
@@ -208,9 +267,12 @@ class SupersetPusher:
             chart_title = chart_config.get("title")
             existing_chart_id = existing_charts_map.get(chart_title)
 
-            # 获取数据集
+            # 获取数据集，优先使用指定的 schema
             model_name = chart_config.get("model")
-            dataset = self.client.get_dataset_by_name(model_name)
+            if schema:
+                dataset = self.client.get_or_create_dataset(model_name, schema=schema)
+            else:
+                dataset = self.client.get_dataset_by_name(model_name)
 
             if not dataset:
                 logger.warning(f"数据集未找到: {model_name}")
@@ -634,20 +696,32 @@ class SupersetPusher:
 
         logger.warning(f"未找到exposure文件: {exposure_name}.yml")
 
-    def _sync_dataset_metrics(self) -> None:
+    def _sync_dataset_metrics(self, model_names: List[str] = None, schema: str = None) -> None:
         """同步 dbt model 中定义的列描述和指标到 Superset 数据集
 
         根据 dbt model 的 meta.metrics 定义，更新 Superset 数据集的 metrics 字段
         根据 dbt model 的 columns.description，更新 Superset 数据集的 columns 字段
         如果数据集不存在，则自动创建
+
+        Args:
+            model_names: 要同步的模型名称列表，None表示同步所有
+            schema: 指定数据集的 schema 名称（优先级最高）
         """
         from .mapper import METRIC_TYPE_TO_SUPERSET_AGG
 
         logger.info("开始同步数据集列描述和指标...")
 
         for model_name, model_meta in self.mapper.models.items():
-            # 获取或创建 Superset 数据集
-            dataset = self.client.get_or_create_dataset(model_name)
+            # 如果指定了模型名称，只同步指定的模型
+            if model_names and model_name not in model_names:
+                continue
+
+            # 获取或创建 Superset 数据集，优先使用指定的 schema
+            if schema:
+                dataset = self.client.get_or_create_dataset(model_name, schema=schema)
+            else:
+                dataset = self.client.get_or_create_dataset(model_name)
+
             if not dataset:
                 logger.warning(f"无法获取或创建数据集: {model_name}，跳过指标同步")
                 continue

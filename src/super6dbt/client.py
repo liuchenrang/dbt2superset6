@@ -28,6 +28,8 @@ class SupersetClient:
     verify_ssl: bool = True
     csrf_token: Optional[str] = None
     session: requests.Session = field(default_factory=requests.Session)
+    schema_map: Dict[str, str] = field(default_factory=dict)
+    database_name: Optional[str] = None  # 指定的数据库名称
 
     def login(self, username: str, password: str, provider: str = "db") -> bool:
         """登录获取token"""
@@ -425,11 +427,95 @@ class SupersetClient:
             return response.json().get("result", [])
         return []
 
-    def get_first_database(self) -> Optional[Dict[str, Any]]:
-        """获取第一个数据库连接"""
+    def get_database_by_name(self, database_name: str) -> Optional[Dict[str, Any]]:
+        """根据名称获取数据库连接
+
+        Args:
+            database_name: 数据库名称
+
+        Returns:
+            数据库信息，未找到返回 None
+        """
         databases = self.get_databases()
-        if databases:
-            return databases[0]
+        for db in databases:
+            if db.get("database_name") == database_name or db.get("name") == database_name:
+                return db
+        return None
+
+    def get_database_tables(self, database_id: int) -> List[Dict[str, Any]]:
+        """获取数据库中的所有表
+
+        Args:
+            database_id: 数据库ID
+
+        Returns:
+            表列表
+        """
+        response = self._request("GET", f"/api/v1/database/{database_id}/tables/")
+        if response.status_code == 200:
+            return response.json().get("result", [])
+        return []
+
+    def get_table_info(self, database_id: int, schema: str, table_name: str) -> Optional[Dict[str, Any]]:
+        """获取表的详细信息
+
+        Args:
+            database_id: 数据库ID
+            schema: schema名称
+            table_name: 表名
+
+        Returns:
+            表信息，未找到返回 None
+        """
+        tables = self.get_database_tables(database_id)
+        for table in tables:
+            if (table.get("schema") == schema and
+                table.get("table_name") == table_name):
+                return table
+        return None
+
+    def get_database_id(self, database_name: str = None) -> Optional[int]:
+        """获取数据库ID
+
+        Args:
+            database_name: 数据库名称，如果为None则使用第一个数据库
+
+        Returns:
+            数据库ID，未找到返回 None
+        """
+        if database_name:
+            db = self.get_database_by_name(database_name)
+            if db:
+                return db.get("id")
+            logger.error(f"数据库 '{database_name}' 未找到")
+            return None
+        else:
+            db = self.get_first_database()
+            if db:
+                return db.get("id")
+            logger.error("没有找到可用的数据库连接")
+            return None
+
+    def _infer_schema_from_table_name(self, table_name: str) -> Optional[str]:
+        """根据表名前缀和 schema_map 推断 dbt 的 schema
+
+        Args:
+            table_name: 表名
+
+        Returns:
+            推断的 schema 名称，无法推断返回 None
+        """
+        # 优先使用 schema_map 中的配置
+        for layer, schema in self.schema_map.items():
+            # 检查表名是否以层名称开头（如 "ods_xxx" 对应 layer "ods"）
+            if table_name.startswith(f"{layer}_"):
+                return schema
+            # 检查表名是否以完整层名开头（如 "ods_xxx" 对应 layer "ods"）
+            if "_" in table_name:
+                first_segment = table_name.split("_")[0]
+                if first_segment == layer:
+                    return schema
+
         return None
 
     def find_table_schema(self, table_name: str, database_id: int) -> Optional[str]:
@@ -442,7 +528,23 @@ class SupersetClient:
         Returns:
             找到的 schema 名称，未找到返回 None
         """
-        # 尝试获取 schemas 列表
+        # 先根据表名前缀推断 schema
+        inferred_schema = self._infer_schema_from_table_name(table_name)
+        if inferred_schema:
+            # 尝试使用推断的 schema
+            payload = {
+                "table_name": table_name,
+                "database": database_id,
+                "schema": inferred_schema
+            }
+            check_resp = self._request("POST", "/api/v1/dataset/", json=payload)
+            if check_resp.status_code == 201:
+                # 成功创建，返回 schema，并删除这个临时 dataset
+                dataset_id = check_resp.json().get("id")
+                self._request("DELETE", f"/api/v1/dataset/{dataset_id}")
+                return inferred_schema
+
+        # 尝试获取 schemas 列表进行自动发现
         response = self._request("GET", f"/api/v1/database/{database_id}/schemas/")
         if response.status_code == 200:
             schemas = response.json().get("result", [])
@@ -472,45 +574,92 @@ class SupersetClient:
 
         Args:
             table_name: 表名
-            database_id: 数据库ID，如果为None则使用第一个数据库
+            database_id: 数据库ID，如果为None则使用配置的数据库名称或第一个数据库
             schema: schema名称，如果为None则自动查找
 
         Returns:
             创建的数据集信息
+
+        Schema 查找优先级：
+        1. 显式指定的 schema 参数（最高优先级）
+        2. 根据表名前缀从 schema_map 推断
+        3. 常见的默认 schema（public, main, default 等）
+        4. 自动遍历数据库所有 schema 尝试查找
+        5. 如果所有方式都失败，报错
         """
         # 获取最新的 CSRF token
         self._get_csrf_token()
 
-        # 如果没有指定数据库，使用第一个
+        # 如果没有指定数据库，使用配置的数据库名称或第一个
         if database_id is None:
-            db = self.get_first_database()
-            if not db:
-                logger.error("没有找到可用的数据库连接")
+            database_id = self.get_database_id(self.database_name)
+            if database_id is None:
                 return None
-            database_id = db.get("id")
 
         # 如果没有指定 schema，自动查找
         if schema is None:
-            # 先尝试常见的 schema
-            common_schemas = ["public", "dev_dbt_demo", "main", "default"]
-            for s in common_schemas:
+            # 优先级 2: 根据表名前缀从 schema_map 推断
+            inferred_schema = self._infer_schema_from_table_name(table_name)
+            if inferred_schema:
+                # 先检查该 schema 下是否存在该表
+                table_info = self.get_table_info(database_id, inferred_schema, table_name)
+                if table_info:
+                    # 表存在，使用推断的 schema
+                    payload = {
+                        "table_name": table_name,
+                        "database": database_id,
+                        "schema": inferred_schema
+                    }
+                    response = self._request("POST", "/api/v1/dataset/", json=payload)
+                    if response.status_code == 201:
+                        result = response.json()
+                        logger.info(f"创建数据集成功: {table_name} (schema: {inferred_schema}, ID: {result.get('id')})")
+                        return result
+
+                logger.debug(f"推断的 schema '{inferred_schema}' 下表不存在，尝试其他方式")
+
+            # 优先级 3: 尝试常见的默认 schema
+            default_schemas = ["public", "main", "default"]
+            for s in default_schemas:
+                table_info = self.get_table_info(database_id, s, table_name)
+                if table_info:
+                    payload = {
+                        "table_name": table_name,
+                        "database": database_id,
+                        "schema": s
+                    }
+                    response = self._request("POST", "/api/v1/dataset/", json=payload)
+                    if response.status_code == 201:
+                        result = response.json()
+                        logger.info(f"创建数据集成功: {table_name} (schema: {s}, ID: {result.get('id')})")
+                        return result
+
+            # 优先级 4: 自动遍历数据库所有 schema 尝试查找
+            schema = self.find_table_schema(table_name, database_id)
+            if schema:
                 payload = {
                     "table_name": table_name,
                     "database": database_id,
-                    "schema": s
+                    "schema": schema
                 }
                 response = self._request("POST", "/api/v1/dataset/", json=payload)
                 if response.status_code == 201:
                     result = response.json()
-                    logger.info(f"创建数据集成功: {table_name} (schema: {s}, ID: {result.get('id')})")
+                    logger.info(f"创建数据集成功: {table_name} (schema: {schema}, ID: {result.get('id')})")
                     return result
 
-            # 常见 schema 都不行，尝试自动发现
-            schema = self.find_table_schema(table_name, database_id)
-            if not schema:
-                logger.error(f"无法找到表 {table_name} 所在的 schema")
-                return None
+            # 优先级 5: 所有方式都失败，报错
+            logger.error(
+                f"无法创建数据集 '{table_name}："
+                f"1. 指定的 schema 参数: {schema if schema else '未指定'}"
+                f"2. 表名前缀推断: {inferred_schema if inferred_schema else '未推断到'}"
+                f"3. 常见默认 schema: 未找到表"
+                f"4. 数据库所有 schema: 未找到表"
+                f"请检查: (1) 表是否存在于数据库中 (2) --schema 参数是否正确"
+            )
+            return None
 
+        # 使用指定的 schema
         payload = {
             "table_name": table_name,
             "database": database_id,
@@ -528,11 +677,69 @@ class SupersetClient:
             return None
 
     def get_datasets(self) -> List[Dict[str, Any]]:
-        """获取所有数据集"""
+        """获取所有数据集（使用多列排序 + ID 遍历补充）"""
+        # 使用 ID 去重
+        dataset_by_id = {}
+        page_size = 25
+
+        # 第一步：使用多个排序列获取数据集列表
+        # Superset API 的排序字段可能为空，导致某些数据集不在结果中
+        # 使用多个排序列可以获取更多数据集
+        order_columns = ['changed_on_delta_humanized', 'table_name']
+
+        for order_col in order_columns:
+            logger.debug(f"使用 order_column={order_col} 获取数据集")
+            page = 1
+            while page <= 10:
+                q_param = f"(order_column:{order_col},order_direction:asc,page:{page},page_size:{page_size})"
+                params = {"q": q_param}
+                response = self._request("GET", "/api/v1/dataset/", params=params)
+
+                if response.status_code != 200:
+                    break
+
+                data = response.json()
+                result = data.get("result", [])
+
+                if not result:
+                    break
+
+                # 使用 ID 去重
+                new_count = 0
+                for ds in result:
+                    ds_id = ds.get("id")
+                    if ds_id is not None and ds_id not in dataset_by_id:
+                        dataset_by_id[ds_id] = ds
+                        new_count += 1
+
+                logger.debug(f"  第 {page} 页: {len(result)} 条, 新增 {new_count}, 累计 {len(dataset_by_id)} 个")
+
+                if new_count == 0:
+                    break
+
+                page += 1
+
+        # 第二步：如果列表 API 获取的数量少于 count，通过 ID 遍历补充
         response = self._request("GET", "/api/v1/dataset/")
-        if response.status_code == 200:
-            return response.json().get("result", [])
-        return []
+        data = response.json()
+        api_count = data.get("count", 0)
+
+        if len(dataset_by_id) < api_count and dataset_by_id:
+            logger.info(f"列表 API 获取到 {len(dataset_by_id)} 个，通过 ID 遍历补充...")
+            existing_ids = set(dataset_by_id.keys())
+            search_min = 1
+            search_max = max(existing_ids) + 100
+
+            for ds_id in range(search_min, search_max + 1):
+                if ds_id not in existing_ids:
+                    ds = self.get_dataset(ds_id)
+                    if ds:
+                        dataset_by_id[ds_id] = ds
+
+        # 转换为列表并按 ID 排序
+        all_datasets = sorted(dataset_by_id.values(), key=lambda x: x.get("id", 0))
+        logger.info(f"获取到 {len(all_datasets)} 个去重数据集")
+        return all_datasets
 
     def get_dataset(self, dataset_id: int) -> Optional[Dict[str, Any]]:
         """获取单个数据集详情（包含列信息）"""
@@ -552,13 +759,14 @@ class SupersetClient:
                 return self.get_dataset(dataset_id)
         return None
 
-    def get_or_create_dataset(self, table_name: str) -> Optional[Dict[str, Any]]:
+    def get_or_create_dataset(self, table_name: str, schema: str = None) -> Optional[Dict[str, Any]]:
         """获取或创建数据集
 
         如果数据集存在则返回，不存在则创建
 
         Args:
             table_name: 表名
+            schema: 指定数据集的 schema 名称（优先级最高）
 
         Returns:
             数据集信息
@@ -570,7 +778,7 @@ class SupersetClient:
 
         # 不存在则创建
         logger.info(f"数据集 {table_name} 不存在，尝试创建...")
-        return self.create_dataset(table_name)
+        return self.create_dataset(table_name, schema=schema)
 
     # ==================== User API ====================
 
@@ -608,8 +816,13 @@ class SupersetClient:
         return None
 
     @classmethod
-    def create_from_config(cls, config: "SupersetConfig") -> "SupersetClient":
+    def create_from_config(cls, config: "SupersetConfig", schema_map: Dict[str, str] = None) -> "SupersetClient":
         """从配置创建客户端"""
-        client = cls(base_url=config.base_url, verify_ssl=config.verify_ssl)
+        client = cls(
+            base_url=config.base_url,
+            verify_ssl=config.verify_ssl,
+            schema_map=schema_map or {},
+            database_name=getattr(config, 'database', None),
+        )
         client.login(config.username, config.password, config.provider)
         return client

@@ -4,8 +4,8 @@
 """
 
 import os
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Dict
 from pathlib import Path
 
 import yaml
@@ -19,6 +19,7 @@ class SupersetConfig:
     password: str
     provider: str = "db"
     verify_ssl: bool = True
+    database: Optional[str] = None  # 数据库名称
 
     @classmethod
     def from_env(cls) -> "SupersetConfig":
@@ -29,6 +30,7 @@ class SupersetConfig:
             password=os.getenv("SUPERSET_PASSWORD", "admin"),
             provider=os.getenv("SUPERSET_PROVIDER", "db"),
             verify_ssl=os.getenv("SUPERSET_VERIFY_SSL", "true").lower() == "true",
+            database=os.getenv("SUPERSET_DATABASE"),
         )
 
     @classmethod
@@ -40,7 +42,8 @@ class SupersetConfig:
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
 
-        return cls(**config["superset"])
+        superset_config = config.get("superset", {})
+        return cls(**superset_config)
 
 
 @dataclass
@@ -49,6 +52,7 @@ class DbtProjectConfig:
     project_dir: Path
     model_paths: list[str]
     exposure_paths: list[str]
+    schema_map: Dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_project_dir(cls, project_dir: str) -> "DbtProjectConfig":
@@ -62,10 +66,30 @@ class DbtProjectConfig:
         with open(dbt_project_yml, "r") as f:
             dbt_config = yaml.safe_load(f)
 
+        # 从 dbt_project.yml 的 models 配置中读取分层 schema 映射
+        schema_map = {}
+        models_config = dbt_config.get("models", {})
+
+        # 递归遍历 models 配置，查找 +schema
+        def _extract_schema_map(config, prefix=""):
+            for key, value in config.items():
+                if key.startswith("+"):
+                    continue
+                full_key = f"{prefix}_{key}" if prefix else key
+                if isinstance(value, dict):
+                    # 检查是否有 +schema
+                    if "+schema" in value:
+                        schema_map[full_key] = value["+schema"]
+                    # 递归处理嵌套配置
+                    _extract_schema_map(value, full_key)
+
+        _extract_schema_map(models_config)
+
         return cls(
             project_dir=project_path,
             model_paths=dbt_config.get("model-paths", ["models"]),
             exposure_paths=dbt_config.get("exposure-paths", ["models/exposures"]),
+            schema_map=schema_map,
         )
 
     @property

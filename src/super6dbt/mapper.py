@@ -149,8 +149,20 @@ class DbtToSuperset:
                 dimension = col_meta["dimension"]
                 column_meta.dimensions = dimension
 
-            # 解析metrics配置
-            if "metrics" in col_meta:
+            # 解析metrics配置（支持单数 metric 和复数 metrics 两种形式）
+            if "metric" in col_meta:
+                # 单数形式 metric: {type: sum, ...}
+                metric_config = col_meta["metric"]
+                column_meta.metrics = {
+                    col_name: MetricConfig(
+                        name=col_name,
+                        type=metric_config.get("type", ""),
+                        description=metric_config.get("description", metric_config.get("label", "")),
+                        sql=metric_config.get("sql", col_name),
+                    )
+                }
+            elif "metrics" in col_meta:
+                # 复数形式 metrics: {metric_name: {...}}
                 column_meta.metrics = {}
                 for metric_name, metric_config in col_meta["metrics"].items():
                     column_meta.metrics[metric_name] = MetricConfig(
@@ -680,7 +692,17 @@ class SupersetToDbt:
 
                 lines.append(f'  {metric_name}: {anchor_id}')
                 lines.append(f'    type: {metric_type}')
-                lines.append(f'    sql: {expression}')
+
+                # 处理 SQL 表达式 - 如果包含换行符或特殊字符，使用 YAML 的字面量块样式
+                sql_cleaned = expression.strip()
+                if '\n' in sql_cleaned or "'" in sql_cleaned or '"' in sql_cleaned:
+                    # 使用字面量块样式（|）保留换行和引号
+                    lines.append('    sql: |')
+                    for line in sql_cleaned.split('\n'):
+                        lines.append(f'      {line}')
+                else:
+                    lines.append(f'    sql: {sql_cleaned}')
+
                 if description:
                     lines.append(f'    description: {description}')
 
@@ -848,7 +870,17 @@ class SupersetToDbt:
 
                 lines.append(f'  {metric_name}: {anchor_id}')
                 lines.append(f'    type: {metric_type}')
-                lines.append(f'    sql: {expression}')
+
+                # 处理 SQL 表达式 - 如果包含换行符或特殊字符，使用 YAML 的字面量块样式
+                sql_cleaned = expression.strip()
+                if '\n' in sql_cleaned or "'" in sql_cleaned or '"' in sql_cleaned:
+                    # 使用字面量块样式（|）保留换行和引号
+                    lines.append('    sql: |')
+                    for line in sql_cleaned.split('\n'):
+                        lines.append(f'      {line}')
+                else:
+                    lines.append(f'    sql: {sql_cleaned}')
+
                 if description:
                     lines.append(f'    description: {description}')
 
@@ -882,7 +914,7 @@ class SupersetToDbt:
                 lines.append(f'      - name: {col_name}')
                 if col_description:
                     lines.append(f'        description: "{col_description}"')
-                lines.append(f'        type: {col_type.lower()}')
+                lines.append(f'        type: {col_type.lower() if col_type else "number"}')
                 lines.append(f'        sql: {expression}')
 
         if physical_columns:
@@ -893,7 +925,7 @@ class SupersetToDbt:
             for i, metric in enumerate(metrics):
                 expression = metric.get("expression", "")
                 metric_name = metric.get("metric_name", "")
-                anchor_id = f"*id00{i + 1}"
+                anchor_ref = f"*id00{i + 1}"
 
                 # 从表达式中提取引用的列名
                 import re

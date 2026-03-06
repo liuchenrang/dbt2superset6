@@ -40,7 +40,7 @@ def cmd_pull(args) -> None:
 
     # 创建客户端
     try:
-        client = SupersetClient.create_from_config(config.superset)
+        client = SupersetClient.create_from_config(config.superset, config.dbt.schema_map)
     except Exception as e:
         logger.error(f"创建Superset客户端失败: {e}")
         sys.exit(1)
@@ -71,7 +71,7 @@ def cmd_push(args) -> None:
 
     # 创建客户端
     try:
-        client = SupersetClient.create_from_config(config.superset)
+        client = SupersetClient.create_from_config(config.superset, config.dbt.schema_map)
     except Exception as e:
         logger.error(f"创建Superset客户端失败: {e}")
         sys.exit(1)
@@ -84,7 +84,13 @@ def cmd_push(args) -> None:
     if args.exposure_names:
         exposure_names = args.exposure_names.split(",")
 
-    pusher.push(exposure_names=exposure_names)
+    model_names = None
+    if args.model_names:
+        model_names = args.model_names.split(",")
+
+    schema = getattr(args, "schema", None)
+
+    pusher.push(exposure_names=exposure_names, model_names=model_names, schema=schema)
 
 
 def cmd_init(args) -> None:
@@ -147,7 +153,7 @@ def cmd_status(args) -> None:
 
     # 测试连接
     try:
-        client = SupersetClient.create_from_config(config.superset)
+        client = SupersetClient.create_from_config(config.superset, config.dbt.schema_map)
         logger.info("✓ Superset连接成功")
 
         # 获取当前用户
@@ -192,12 +198,19 @@ def main() -> None:
   # 推送指定exposure到Superset
   super6dbt push --exposure-names my_dashboard
 
+  # 仅推送指定model的数据集（不创建面板）
+  super6dbt push --model-names orders,products
+
+  # 推送指定model的数据集，指定schema
+  super6dbt push --model-names ads_channel_conversion_analysis_full --schema wa_ads
+
 环境变量:
   SUPERSET_BASE_URL     Superset基础URL
   SUPERSET_USERNAME    登录用户名
   SUPERSET_PASSWORD    登录密码
   SUPERSET_PROVIDER    认证方式 (默认: db)
   SUPERSET_VERIFY_SSL  是否验证SSL (默认: true)
+  SUPERSET_DATABASE    数据库名称（可选，用于创建数据集）
         """,
     )
 
@@ -232,6 +245,16 @@ def main() -> None:
         "--exposure-names",
         type=str,
         help="要推送的exposure名称列表，逗号分隔",
+    )
+    push_parser.add_argument(
+        "--model-names",
+        type=str,
+        help="要推送的model名称列表（仅同步数据集），逗号分隔",
+    )
+    push_parser.add_argument(
+        "--schema",
+        type=str,
+        help="指定数据集的 schema 名称（优先级最高）",
     )
 
     # init命令
