@@ -53,6 +53,7 @@ class DbtProjectConfig:
     model_paths: list[str]
     exposure_paths: list[str]
     schema_map: Dict[str, str] = field(default_factory=dict)
+    default_schema: Optional[str] = None  # 从 profiles.yml 读取的默认 schema
 
     @classmethod
     def from_project_dir(cls, project_dir: str) -> "DbtProjectConfig":
@@ -85,12 +86,56 @@ class DbtProjectConfig:
 
         _extract_schema_map(models_config)
 
+        # 从 profiles.yml 读取默认 schema
+        default_schema = cls._read_schema_from_profiles(dbt_config.get("profile"), project_path)
+
         return cls(
             project_dir=project_path,
             model_paths=dbt_config.get("model-paths", ["models"]),
             exposure_paths=dbt_config.get("exposure-paths", ["models/exposures"]),
             schema_map=schema_map,
+            default_schema=default_schema,
         )
+
+    @classmethod
+    def _read_schema_from_profiles(cls, profile_name: Optional[str], project_path: Path) -> Optional[str]:
+        """从 profiles.yml 读取默认 schema
+
+        查找顺序：
+        1. 环境变量 DBT_PROFILES_DIR 指定的目录
+        2. ~/.dbt/profiles.yml
+        3. 项目目录下的 profiles.yml
+        """
+        if not profile_name:
+            return None
+
+        # 可能的 profiles.yml 路径
+        profiles_paths = [
+            Path(os.environ.get("DBT_PROFILES_DIR", "")) / "profiles.yml" if os.environ.get("DBT_PROFILES_DIR") else None,
+            Path.home() / ".dbt" / "profiles.yml",
+            project_path / "profiles.yml",
+        ]
+
+        for profiles_path in profiles_paths:
+            if profiles_path and profiles_path.exists():
+                try:
+                    with open(profiles_path, "r") as f:
+                        profiles = yaml.safe_load(f)
+
+                    # 获取 profile 配置
+                    profile_config = profiles.get(profile_name, {})
+                    target = profile_config.get("target", "dev")
+                    outputs = profile_config.get("outputs", {})
+                    target_config = outputs.get(target, {})
+
+                    # 返回 schema
+                    schema = target_config.get("schema")
+                    if schema:
+                        return schema
+                except Exception:
+                    continue
+
+        return None
 
     @property
     def full_model_paths(self) -> list[Path]:

@@ -40,7 +40,11 @@ def cmd_pull(args) -> None:
 
     # 创建客户端
     try:
-        client = SupersetClient.create_from_config(config.superset, config.dbt.schema_map)
+        client = SupersetClient.create_from_config(
+            config.superset,
+            config.dbt.schema_map,
+            config.dbt.default_schema
+        )
     except Exception as e:
         logger.error(f"创建Superset客户端失败: {e}")
         sys.exit(1)
@@ -71,7 +75,11 @@ def cmd_push(args) -> None:
 
     # 创建客户端
     try:
-        client = SupersetClient.create_from_config(config.superset, config.dbt.schema_map)
+        client = SupersetClient.create_from_config(
+            config.superset,
+            config.dbt.schema_map,
+            config.dbt.default_schema
+        )
     except Exception as e:
         logger.error(f"创建Superset客户端失败: {e}")
         sys.exit(1)
@@ -153,7 +161,11 @@ def cmd_status(args) -> None:
 
     # 测试连接
     try:
-        client = SupersetClient.create_from_config(config.superset, config.dbt.schema_map)
+        client = SupersetClient.create_from_config(
+            config.superset,
+            config.dbt.schema_map,
+            config.dbt.default_schema
+        )
         logger.info("✓ Superset连接成功")
 
         # 获取当前用户

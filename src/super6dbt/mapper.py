@@ -62,8 +62,11 @@ VIZ_TYPE_MAP = {
     "line": "echarts_timeseries_line",
     "bar": "echarts_timeseries_bar",
     "table": "table",
-    "number": "big_number",
+    "number": "big_number_total",
+    "big_number": "big_number_total",
     "pie": "echarts_pie",
+    "doughnut": "echarts_pie",
+    "area": "echarts_timeseries",
 }
 
 # ==================== dbt -> Superset ====================

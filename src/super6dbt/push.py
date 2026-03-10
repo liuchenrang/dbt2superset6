@@ -257,7 +257,16 @@ class SupersetPusher:
             logger.warning(f"无法获取面板: {dashboard_id}")
             return
 
-        chart_positions = dashboard.get("position_json", {})
+        chart_positions = dashboard.get("position_json") or {}
+
+        # 获取面板上已有的图表ID列表（用于验证图表是否存在）
+        dashboard_chart_ids = set()
+        if isinstance(chart_positions, dict):
+            for key, value in chart_positions.items():
+                if isinstance(value, dict) and value.get("type") == "CHART":
+                    chart_id = value.get("meta", {}).get("chartId")
+                    if chart_id:
+                        dashboard_chart_ids.add(chart_id)
 
         # 收集需要关联的图表ID列表
         chart_ids_to_add = []
@@ -266,6 +275,12 @@ class SupersetPusher:
         for chart_config in charts_config:
             chart_title = chart_config.get("title")
             existing_chart_id = existing_charts_map.get(chart_title)
+
+            # 验证 existing_chart_id 是否有效（图表是否真实存在）
+            chart_exists = False
+            if existing_chart_id:
+                # 检查图表 ID 是否在当前面板的图表列表中，或通过 API 验证
+                chart_exists = self._verify_chart_exists(existing_chart_id, dashboard_chart_ids)
 
             # 获取数据集，优先使用指定的 schema
             model_name = chart_config.get("model")
@@ -292,10 +307,20 @@ class SupersetPusher:
             # 构建图表参数
             params = self._build_chart_params(chart_config, dataset)
 
-            if existing_chart_id:
+            if chart_exists and existing_chart_id:
                 # 更新现有图表
-                self._update_chart(existing_chart_id, chart_title, params, viz_type)
-                chart_ids_to_add.append(existing_chart_id)
+                update_success = self._update_chart(existing_chart_id, chart_title, params, viz_type)
+                if update_success:
+                    chart_ids_to_add.append(existing_chart_id)
+                else:
+                    # 更新失败，创建新图表
+                    logger.warning(f"图表更新失败，尝试创建新图表: {chart_title}")
+                    new_chart_id = self._create_chart(
+                        dataset_id, chart_title, params, viz_type, dashboard_id
+                    )
+                    if new_chart_id:
+                        existing_charts_map[chart_title] = new_chart_id
+                        chart_ids_to_add.append(new_chart_id)
             else:
                 # 创建新图表
                 new_chart_id = self._create_chart(
@@ -313,6 +338,27 @@ class SupersetPusher:
             exposure_meta["existing_charts"] = existing_charts_map
             self._update_exposure_file(exposure.get("name"), exposure)
 
+    def _verify_chart_exists(self, chart_id: int, dashboard_chart_ids: set = None) -> bool:
+        """验证图表是否存在于 Superset
+
+        Args:
+            chart_id: 图表ID
+            dashboard_chart_ids: 当前面板已有的图表ID集合（可选）
+
+        Returns:
+            图表是否存在
+        """
+        # 首先检查是否在面板图表列表中
+        if dashboard_chart_ids and chart_id in dashboard_chart_ids:
+            return True
+
+        # 通过 API 验证图表是否存在
+        try:
+            result = self.client.get_chart(chart_id)
+            return result is not None
+        except Exception:
+            return False
+
     def _build_chart_params(self, chart_config: Dict[str, Any], dataset: Dict[str, Any]) -> Dict[str, Any]:
         """构建图表参数 - 使用Superset 6.0的正确格式
 
@@ -329,9 +375,6 @@ class SupersetPusher:
         params = {
             "datasource": f"{dataset_id}__table",
             "viz_type": viz_type,
-            "time_range": chart_config.get("time_range", "No filter"),
-            "row_limit": 10000,
-            "order_desc": True,
         }
 
         # 获取数据集的列信息
@@ -565,7 +608,36 @@ class SupersetPusher:
         chart_config: Dict[str, Any]
     ) -> Dict[str, Any]:
         """根据图表类型添加特定配置"""
-        if chart_type == "line":
+        # big_number, big_number_total, number 都是数字卡片类型
+        if chart_type in ("big_number", "number", "big_number_total"):
+            # 确保移除任何时间相关配置
+            params.pop("granularity_sqla", None)
+            params.pop("time_grain_sqla", None)
+            params.pop("x_axis", None)
+            params.pop("adhoc_filters", None)
+            params.pop("time_range", None)
+
+            # 设置 big_number_total 特定配置
+            metrics = chart_config.get("metrics", [])
+            if metrics:
+                # big_number_total 使用 metric (字符串) 而不是 metrics (数组)
+                params["metric"] = metrics[0]
+                # 同时移除 metrics，因为 big_number_total 不使用它
+                params.pop("metrics", None)
+
+            # subheader 映射到 subtitle
+            extra_label = chart_config.get("extra_label")
+            if extra_label:
+                params["subtitle"] = extra_label
+
+            # 添加 big_number_total 样式配置
+            params.setdefault("header_font_size", 0.4)
+            params.setdefault("subtitle_font_size", 0.15)
+            params.setdefault("metric_name_font_size", 0.15)
+            params.setdefault("y_axis_format", "SMART_NUMBER")
+            params.setdefault("time_format", "smart_date")
+
+        elif chart_type == "line":
             # 折线图配置
             params.setdefault("show_markers", True)
             params.setdefault("show_legend", True)
@@ -576,19 +648,23 @@ class SupersetPusher:
             params.setdefault("show_legend", True)
             params.setdefault("bar_stacked", False)
 
-        elif chart_type == "number":
-            # 数字卡片配置
-            params.setdefault("subheader", chart_config.get("description", ""))
-
-        elif chart_type == "pie":
-            # 饼图配置
+        elif chart_type == "pie" or chart_type == "doughnut":
+            # 饼图/环形图配置
             params.setdefault("show_legend", True)
             params.setdefault("label_type", "key")
+            # 移除时间配置（饼图不需要）
+            params.pop("granularity_sqla", None)
+            params.pop("time_grain_sqla", None)
+            params.pop("x_axis", None)
 
         elif chart_type == "table":
             # 表格配置
             params.setdefault("server_pagination", True)
             params.setdefault("order_by_cols", [])
+            # 移除时间配置
+            params.pop("granularity_sqla", None)
+            params.pop("time_grain_sqla", None)
+            params.pop("x_axis", None)
 
         return params
 
@@ -625,21 +701,25 @@ class SupersetPusher:
         title: str,
         params: Dict[str, Any],
         viz_type: str,
-    ) -> None:
-        """更新图表"""
-        # 将params序列化为JSON字符串
-        params_json = json.dumps(params, ensure_ascii=False)
+    ) -> bool:
+        """更新图表
 
+        Returns:
+            是否更新成功
+        """
+        # 直接传递 params 字典，让 update_chart 方法处理序列化
         result = self.client.update_chart(
             chart_id=chart_id,
             title=title,
-            params=params_json,
+            params=params,
         )
 
         if result:
             logger.info(f"更新图表: {title} (ID: {chart_id})")
+            return True
         else:
             logger.warning(f"更新图表失败: ID {chart_id}")
+            return False
 
     def _update_dashboard_charts(
         self,
@@ -647,10 +727,9 @@ class SupersetPusher:
         chart_ids: List[int],
         existing_positions: Dict[str, Any] = None,
     ) -> None:
-        """更新面板关联的图表列表
+        """更新面板关联的图表列表并构建 position_json 布局
 
-        注意：Superset 6.0 的图表关联在创建图表时通过 dashboards 参数完成。
-        此方法仅用于更新面板标题等基本信息，不处理 position_json。
+        Superset 6.0 需要正确的 position_json 结构来显示图表
         """
         # 获取现有面板信息
         dashboard = self.client.get_dashboard(dashboard_id)
@@ -658,43 +737,153 @@ class SupersetPusher:
             logger.warning(f"无法获取面板: {dashboard_id}")
             return
 
-        # 图表已在创建时关联到面板，无需额外更新
+        # 获取所有图表信息
+        charts_info = {}
+        for chart_id in chart_ids:
+            chart = self.client.get_chart(chart_id)
+            if chart:
+                charts_info[chart_id] = {
+                    "chartId": chart_id,
+                    "slice_id": chart.get("id"),
+                    "sliceName": chart.get("slice_name"),
+                    "viz_type": chart.get("viz_type"),
+                }
+
+        # 构建 Superset 6.0 兼容的 position_json
+        position_json = {
+            "DASHBOARD_VERSION_KEY": "v2",
+            "ROOT_ID": {
+                "id": "ROOT",
+                "type": "ROOT",
+                "children": ["TABS-0"],
+            },
+            "TABS-0": {
+                "id": "TABS-0",
+                "type": "TAB",
+                "children": [],
+                "meta": {"text": "Tab 1"}
+            },
+            "CHART-UUID": {},
+        }
+
+        # 布局配置
+        KPI_ROW_SIZE = 3  # KPI 每行8个，每个占3个单位宽度
+        CHART_ROW_SIZE = 6  # 图表每行2个，每个占6个单位宽度
+
+        # 添加 KPI 图表（前8个）
+        kpi_chart_ids = chart_ids[:8]
+        for i, chart_id in enumerate(kpi_chart_ids):
+            col = i * KPI_ROW_SIZE
+            row = 0
+            position_json["TABS-0"]["children"].append(str(chart_id))
+            position_json["CHART-UUID"][str(chart_id)] = str(chart_id)
+            position_json[str(chart_id)] = {
+                "id": chart_id,
+                "type": "CHART",
+                "meta": charts_info.get(chart_id, {}),
+                "position": {
+                    "x": col,
+                    "y": row * 6,  # 每行高度为6
+                    "w": KPI_ROW_SIZE,
+                    "h": 4,
+                },
+            }
+
+        # 添加其他图表（每行2个）
+        for idx, chart_id in enumerate(chart_ids[8:], start=0):
+            row = 1 + idx // 2
+            col = (idx % 2) * CHART_ROW_SIZE
+
+            position_json["TABS-0"]["children"].append(str(chart_id))
+            position_json["CHART-UUID"][str(chart_id)] = str(chart_id)
+            position_json[str(chart_id)] = {
+                "id": chart_id,
+                "type": "CHART",
+                "meta": charts_info.get(chart_id, {}),
+                "position": {
+                    "x": col,
+                    "y": row * 8,  # 每行高度为8
+                    "w": CHART_ROW_SIZE,
+                    "h": 6,
+                },
+            }
+
+        # 更新面板的 position_json
+        self.client.update_dashboard(
+            dashboard_id=dashboard_id,
+            positions=position_json
+        )
+
         logger.info(f"图表已关联到面板 ID {dashboard_id}, 图表数量: {len(chart_ids)}")
 
     def _update_exposure_file(self, exposure_name: str, exposure: Dict[str, Any]) -> None:
-        """更新exposure文件"""
+        """更新exposure文件
+
+        支持两种文件结构：
+        1. 单独文件: {exposure_name}.yml
+        2. 合并文件: exposures.yml 或其他包含多个 exposure 的文件
+        """
         exposure_paths = self.dbt_config.full_exposure_paths
 
         for exposure_path in exposure_paths:
+            # 方式1: 尝试单独的 exposure 文件
             file_path = exposure_path / f"{exposure_name}.yml"
-
             if file_path.exists():
-                try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        data = yaml.safe_load(f) or {}
-
-                    exposures = data.get("exposures", [])
-
-                    # 更新对应的exposure
-                    for i, exp in enumerate(exposures):
-                        if exp.get("name") == exposure_name:
-                            exposures[i] = exposure
-                            break
-
-                    data["exposures"] = exposures
-
-                    # 写回文件
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-
-                    logger.info(f"更新exposure文件: {file_path}")
+                if self._write_exposure_to_file(file_path, exposure_name, exposure):
                     return
 
-                except Exception as e:
-                    logger.error(f"更新exposure文件失败 {file_path}: {e}")
-                    continue
+            # 方式2: 遍历目录下所有 yml 文件，查找包含该 exposure 的文件
+            for pattern in ["*.yml", "*.yaml"]:
+                for yml_file in exposure_path.glob(pattern):
+                    if yml_file.is_file():
+                        # 跳过已经尝试过的单独文件
+                        if yml_file.name == f"{exposure_name}.yml":
+                            continue
+                        if self._write_exposure_to_file(yml_file, exposure_name, exposure):
+                            return
 
-        logger.warning(f"未找到exposure文件: {exposure_name}.yml")
+        logger.warning(f"未找到exposure文件: {exposure_name}")
+
+    def _write_exposure_to_file(self, file_path: Path, exposure_name: str, exposure: Dict[str, Any]) -> bool:
+        """将 exposure 写入指定文件
+
+        Args:
+            file_path: 文件路径
+            exposure_name: exposure 名称
+            exposure: exposure 数据
+
+        Returns:
+            是否成功写入
+        """
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+
+            exposures = data.get("exposures", [])
+
+            # 查找并更新对应的 exposure
+            found = False
+            for i, exp in enumerate(exposures):
+                if exp.get("name") == exposure_name:
+                    exposures[i] = exposure
+                    found = True
+                    break
+
+            if not found:
+                return False
+
+            data["exposures"] = exposures
+
+            # 写回文件
+            with open(file_path, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+            logger.info(f"更新exposure文件: {file_path}")
+            return True
+
+        except Exception as e:
+            logger.error(f"更新exposure文件失败 {file_path}: {e}")
+            return False
 
     def _sync_dataset_metrics(self, model_names: List[str] = None, schema: str = None) -> None:
         """同步 dbt model 中定义的列描述和指标到 Superset 数据集
@@ -755,17 +944,18 @@ class SupersetPusher:
 
                         # 构建 SQL 表达式
                         if metric_config.sql:
-                            sql_expr = metric_config.sql
+                            raw_sql = metric_config.sql.strip()
+                            # 检查是否已包含聚合函数
+                            if self._validate_metric_aggregation(raw_sql):
+                                sql_expr = raw_sql
+                            else:
+                                # sql 字段只是列名，自动添加聚合函数
+                                sql_expr = f"{agg_func}({raw_sql})"
                         elif agg_func == "COUNT_DISTINCT":
                             # COUNT_DISTINCT 需要转换为标准 SQL: COUNT(DISTINCT column)
                             sql_expr = f"COUNT(DISTINCT {col_name})"
                         else:
                             sql_expr = f"{agg_func}({col_name})"
-
-                        # 验证 SQL 表达式必须包含聚合函数
-                        if not self._validate_metric_aggregation(sql_expr):
-                            logger.warning(f"跳过 metric '{metric_name}': SQL expression 必须包含聚合函数 (SUM, COUNT, AVG, MIN, MAX): {sql_expr}")
-                            continue
 
                         # 构建指标对象
                         metric_obj = {
@@ -811,11 +1001,19 @@ class SupersetPusher:
             if csrf_token:
                 self.client.csrf_token = csrf_token
 
-        # 清理指标对象，只保留必要字段
+        # 清理指标对象，只保留必要字段，并去重
         clean_metrics = []
+        seen_metric_names = set()
         for m in metrics:
+            metric_name = m.get("metric_name")
+            # 跳过重复的 metric_name
+            if metric_name in seen_metric_names:
+                logger.warning(f"跳过重复的 metric: {metric_name}")
+                continue
+            seen_metric_names.add(metric_name)
+
             clean_m = {
-                "metric_name": m.get("metric_name"),
+                "metric_name": metric_name,
                 "verbose_name": m.get("verbose_name"),
                 "expression": m.get("expression"),
             }
@@ -874,11 +1072,19 @@ class SupersetPusher:
             if csrf_token:
                 self.client.csrf_token = csrf_token
 
-        # 清理指标对象，只保留必要字段
+        # 清理指标对象，只保留必要字段，并去重
         clean_metrics = []
+        seen_metric_names = set()
         for m in metrics:
+            metric_name = m.get("metric_name")
+            # 跳过重复的 metric_name
+            if metric_name in seen_metric_names:
+                logger.warning(f"跳过重复的 metric: {metric_name}")
+                continue
+            seen_metric_names.add(metric_name)
+
             clean_m = {
-                "metric_name": m.get("metric_name"),
+                "metric_name": metric_name,
                 "verbose_name": m.get("verbose_name"),
                 "expression": m.get("expression"),
             }
