@@ -982,6 +982,33 @@ class SupersetClient:
             return response.json().get("result")
         return None
 
+    def find_dataset_by_name(self, table_name: str) -> Optional[Dict[str, Any]]:
+        """直接通过名称搜索数据集（不获取全部列表）
+
+        使用 Superset API 的 filters 功能直接搜索，避免获取所有数据集列表。
+
+        Args:
+            table_name: 数据集名称（表名）
+
+        Returns:
+            数据集详情（包含列信息），未找到返回 None
+        """
+        # 使用 filters 直接搜索
+        params = {
+            "q": f'{{"filters":[{{"col":"table_name","opr":"eq","value":"{table_name}"}}]}}'
+        }
+        response = self._request("GET", "/api/v1/dataset/", params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            results = data.get("result", [])
+            if results:
+                # 获取完整的数据集详情（包含列信息）
+                dataset_id = results[0].get("id")
+                if dataset_id:
+                    return self.get_dataset(dataset_id)
+        return None
+
     def get_dataset_by_name(self, name: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
         """通过名称获取数据集（包含列信息）
 
@@ -997,13 +1024,11 @@ class SupersetClient:
                 if dataset_id:
                     return self.get_dataset(dataset_id)
 
-        # 先获取数据集列表
-        datasets = self.get_datasets(use_cache=use_cache)
-        for dataset in datasets:
-            if dataset.get("table_name") == name:
-                # 获取完整的数据集详情（包含列信息）
-                dataset_id = dataset.get("id")
-                return self.get_dataset(dataset_id)
+        # 直接通过名称搜索，避免获取全部列表
+        dataset = self.find_dataset_by_name(name)
+        if dataset:
+            return dataset
+
         return None
 
     def get_or_create_dataset(self, table_name: str, schema: str = None) -> Optional[Dict[str, Any]]:
