@@ -169,7 +169,8 @@ class SupersetPuller:
     ) -> None:
         """更新单个schema文件 - 初始化或更新模型的 meta 配置
 
-        保留 computed_columns 和 x-metric-definitions 字段，确保计算列同步
+        保留 computed_columns 字段，确保计算列同步。
+        metrics 放在模型的 meta.metrics 层级，和 columns 分开。
         """
         try:
             with open(schema_file, "r", encoding="utf-8") as f:
@@ -184,9 +185,8 @@ class SupersetPuller:
             if not models:
                 return
 
-            # 保留现有的 computed_columns 和 x-metric-definitions
+            # 保留现有的 computed_columns
             existing_computed_columns_map = {}
-            existing_metric_definitions = data.get("x-metric-definitions", {})
 
             # 更新每个model的meta信息
             updated = False
@@ -199,6 +199,18 @@ class SupersetPuller:
                     if "computed_columns" in model:
                         existing_computed_columns_map[model_name] = model["computed_columns"]
 
+                    # 更新模型级别的 meta.metrics（从数据集同步）
+                    if "meta" in dataset_meta and "metrics" in dataset_meta["meta"]:
+                        if "meta" not in model:
+                            model["meta"] = {}
+                        if "metrics" not in model["meta"]:
+                            model["meta"]["metrics"] = {}
+
+                        # 合并 metrics（保留用户自定义的，添加新的）
+                        for metric_name, metric_config in dataset_meta["meta"]["metrics"].items():
+                            if metric_name not in model["meta"]["metrics"]:
+                                model["meta"]["metrics"][metric_name] = metric_config
+
                     # 确保columns存在
                     if "columns" not in model:
                         model["columns"] = []
@@ -210,7 +222,7 @@ class SupersetPuller:
                         if col_name:
                             existing_columns[col_name] = col
 
-                    # 从数据集meta中获取列配置
+                    # 从数据集meta中获取列配置（只包含维度，不包含 metrics）
                     meta_columns = dataset_meta.get("columns", {})
 
                     # 处理每个meta列
@@ -240,21 +252,11 @@ class SupersetPuller:
                                         if key not in current_meta["dimension"]:
                                             current_meta["dimension"][key] = value
 
-                            # 合并metrics配置
-                            if "metrics" in col_meta:
-                                if "metrics" not in current_meta:
-                                    current_meta["metrics"] = col_meta["metrics"]
-                                else:
-                                    # 合并每个metric
-                                    for metric_name, metric_config in col_meta["metrics"].items():
-                                        if metric_name not in current_meta["metrics"]:
-                                            current_meta["metrics"][metric_name] = metric_config
-
                             # 更新description（如果meta中有且当前为空）
                             if col_meta_config.get("description") and not existing_col.get("description"):
                                 existing_col["description"] = col_meta_config["description"]
                         else:
-                            # 添加新列（仅meta配置）
+                            # 添加新列（仅维度配置）
                             new_col = {
                                 "name": col_name,
                                 "description": col_meta_config.get("description", ""),
@@ -270,10 +272,6 @@ class SupersetPuller:
                     model_name = model.get("name")
                     if model_name in existing_computed_columns_map:
                         model["computed_columns"] = existing_computed_columns_map[model_name]
-
-                # 恢复 x-metric-definitions（如果存在）
-                if existing_metric_definitions:
-                    data["x-metric-definitions"] = existing_metric_definitions
 
                 # 写回文件，保持原有格式
                 with open(schema_file, "w", encoding="utf-8") as f:

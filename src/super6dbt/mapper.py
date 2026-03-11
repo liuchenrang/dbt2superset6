@@ -503,11 +503,47 @@ class SupersetToDbt:
     def dataset_to_model_meta(
         self, dataset: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """将数据集转换为模型的meta配置"""
+        """将数据集转换为模型的meta配置
+
+        返回格式说明：
+        - columns 只包含维度信息（dimension），不包含 metrics
+        - metrics 放在顶层的 meta.metrics 字段中
+        """
         table_name = dataset.get("table_name")
         columns_meta = {}
+        model_metrics = {}
 
-        # 处理列配置
+        # 处理 Superset 数据集的 metrics（模型级别）
+        metrics = dataset.get("metrics", [])
+        for metric in metrics:
+            metric_name = metric.get("metric_name", "")
+            expression = metric.get("expression", "")
+            description = metric.get("description", "")
+            verbose_name = metric.get("verbose_name", "")
+
+            if not metric_name or not expression:
+                continue
+
+            # 从 expression 解析度量类型
+            metric_type = "sum"
+            if "COUNT_DISTINCT" in expression:
+                metric_type = "count_distinct"
+            elif "COUNT" in expression and "DISTINCT" not in expression:
+                metric_type = "count"
+            elif "AVG" in expression:
+                metric_type = "avg"
+            elif "MIN" in expression:
+                metric_type = "min"
+            elif "MAX" in expression:
+                metric_type = "max"
+
+            model_metrics[metric_name] = {
+                "type": metric_type,
+                "sql": expression,
+                "description": verbose_name or description,
+            }
+
+        # 处理列配置（只包含维度，不包含 metrics）
         columns = dataset.get("columns", [])
         for col in columns:
             col_name = col.get("column_name")
@@ -517,59 +553,37 @@ class SupersetToDbt:
             col_type = col.get("type", "")
             dbt_type = SUPERSET_TYPE_TO_DBT.get(col_type, "string")
 
-            meta_key = "dimension"
-
-            # 如果是度量（有expression_type）
-            if col.get("expression_type") == "SIMPLE":
-                metric_name = col.get("metric_name", col_name)
-                meta_key = "metrics"
-
-                # 从sql_expression解析度量类型
-                sql_expr = col.get("sql_expression", "")
-                metric_type = "sum"
-                if "COUNT_DISTINCT" in sql_expr:
-                    metric_type = "count_distinct"
-                elif "COUNT" in sql_expr:
-                    metric_type = "count"
-                elif "AVG" in sql_expr:
-                    metric_type = "avg"
-                elif "MIN" in sql_expr:
-                    metric_type = "min"
-                elif "MAX" in sql_expr:
-                    metric_type = "max"
-
-                columns_meta[col_name] = {
-                    "description": col.get("description", ""),
-                    "config": {
-                        "meta": {
-                            "metrics": {
-                                metric_name: {
-                                    "type": metric_type,
-                                    "description": col.get("verbose_name", metric_name),
-                                    "sql": sql_expr,
-                                }
-                            }
+            # 只处理维度列（有 expression 的计算列也作为维度处理）
+            columns_meta[col_name] = {
+                "description": col.get("description", ""),
+                "config": {
+                    "meta": {
+                        "dimension": {
+                            "type": dbt_type,
+                            "label": col.get("verbose_name", col_name),
                         }
                     }
                 }
-            else:
-                # 维度
-                columns_meta[col_name] = {
-                    "description": col.get("description", ""),
-                    "config": {
-                        "meta": {
-                            "dimension": {
-                                "type": dbt_type,
-                                "label": col.get("verbose_name", col_name),
-                            }
-                        }
-                    }
+            }
+
+            # 如果有 expression（计算列），添加 superset 扩展
+            if col.get("expression"):
+                columns_meta[col_name]["config"]["meta"]["superset"] = {
+                    "expression": col.get("expression", "")
                 }
 
-        return {
+        result = {
             "name": table_name,
             "columns": columns_meta,
         }
+
+        # 添加模型级别的 meta.metrics
+        if model_metrics:
+            result["meta"] = {
+                "metrics": model_metrics
+            }
+
+        return result
 
     def generate_yaml_exposure(self, exposure: Dict[str, Any]) -> str:
         """生成exposure YAML"""
@@ -666,6 +680,10 @@ class SupersetToDbt:
 
         Returns:
             YAML 格式的 schema 内容（Lightdash 格式）
+
+        生成格式说明：
+        - metrics 放在模型的 meta.metrics 层级，和 columns 分开
+        - columns 中只包含维度信息（dimension）
         """
         table_name = dataset.get("table_name", "")
         if not table_name:
@@ -677,16 +695,35 @@ class SupersetToDbt:
         columns = dataset.get("columns", [])
         metrics = dataset.get("metrics", [])
 
+        # 分类列：物理列和计算列
+        physical_columns = [c for c in columns if not c.get("expression")]
+        calculated_columns = [c for c in columns if c.get("expression")]
+
         lines = []
 
-        # 生成 x-metric-definitions（Lightdash 格式）
-        if metrics:
-            lines.append('x-metric-definitions:')
+        # 生成 models 定义
+        lines.append('version: 2')
+        lines.append('')
+        lines.append('models:')
+        lines.append(f"  - name: {table_name}")
 
-            for i, metric in enumerate(metrics):
+        # 使用 Superset 数据集的 description，如果没有则使用默认值
+        dataset_description = dataset.get("description", f"从 Superset 数据集 {table_name} 同步")
+        if dataset_description:
+            lines.append(f'    description: "{dataset_description}"')
+        else:
+            lines.append(f'    description: "从 Superset 数据集 {table_name} 同步"')
+
+        # 生成模型级别的 meta.metrics（和 columns 分开）
+        if metrics:
+            lines.append('    meta:')
+            lines.append('      metrics:')
+
+            for metric in metrics:
                 metric_name = metric.get("metric_name", "")
                 expression = metric.get("expression", "")
                 description = metric.get("description", "")
+                verbose_name = metric.get("verbose_name", "")
 
                 if not metric_name or not expression:
                     continue
@@ -704,61 +741,29 @@ class SupersetToDbt:
                 elif "MAX" in expression:
                     metric_type = "max"
 
-                # YAML anchor 引用ID
-                anchor_id = f"&id00{i + 1}"
-
-                lines.append(f'  {metric_name}: {anchor_id}')
-                lines.append(f'    type: {metric_type}')
+                lines.append(f'        {metric_name}:')
+                lines.append(f'          type: {metric_type}')
 
                 # 处理 SQL 表达式 - 如果包含换行符或特殊字符，使用 YAML 的字面量块样式
                 sql_cleaned = expression.strip()
                 if '\n' in sql_cleaned or "'" in sql_cleaned or '"' in sql_cleaned:
                     # 使用字面量块样式（|）保留换行和引号
-                    lines.append('    sql: |')
+                    lines.append('          sql: |')
                     for line in sql_cleaned.split('\n'):
-                        lines.append(f'      {line}')
+                        lines.append(f'            {line}')
                 else:
-                    lines.append(f'    sql: {sql_cleaned}')
+                    lines.append(f'          sql: {sql_cleaned}')
 
-                if description:
-                    lines.append(f'    description: {description}')
+                # 优先使用 verbose_name 作为 description
+                metric_desc = verbose_name or description
+                if metric_desc:
+                    lines.append(f'          description: "{metric_desc}"')
 
-            lines.append('')
-
-        # 生成 models 定义
-        lines.append('version: 2')
-        lines.append('')
-        lines.append('models:')
-        lines.append(f"  - name: {table_name}")
-
-        # 使用 Superset 数据集的 description，如果没有则使用默认值
-        dataset_description = dataset.get("description", f"从 Superset 数据集 {table_name} 同步")
-        if dataset_description:
-            lines.append(f'    description: "{dataset_description}"')
-        else:
-            lines.append(f'    description: "从 Superset 数据集 {table_name} 同步"')
-
-        if columns:
+        # 生成 columns（只包含维度信息，不包含 metrics）
+        if physical_columns:
             lines.append('    columns:')
 
-            # 构建列名到度量类型的映射
-            col_metrics_map = {}
-            for i, metric in enumerate(metrics):
-                expression = metric.get("expression", "")
-                metric_name = metric.get("metric_name", "")
-                anchor_id = f"*id00{i + 1}"
-
-                # 从表达式中提取引用的列名
-                # 例如: SUM(total) -> total, COUNT(*) -> None
-                import re
-                match = re.search(r'\b(\w+)\s*\)$', expression)
-                if match:
-                    col_name = match.group(1)
-                    if col_name not in col_metrics_map:
-                        col_metrics_map[col_name] = []
-                    col_metrics_map[col_name].append((metric_name, anchor_id))
-
-            for col in columns:
+            for col in physical_columns:
                 col_name = col.get("column_name", "")
                 if not col_name:
                     continue
@@ -779,15 +784,9 @@ class SupersetToDbt:
                 lines.append(f'            type: {dbt_type}')
                 lines.append(f'            label: null')
 
-                # 度量配置（如果该列有相关度量）
-                if col_name in col_metrics_map:
-                    lines.append('          metrics:')
-                    for metric_name, anchor_ref in col_metrics_map[col_name]:
-                        lines.append(f'            {metric_name}: {anchor_ref}')
-
         # 处理计算列（添加到 columns 中，使用 meta.superset 扩展）
-        calculated_columns = [c for c in columns if c.get("expression")]
         if calculated_columns:
+            # 如果前面没有 columns 块，添加一个
             if not physical_columns:
                 lines.append('    columns:')
 
@@ -846,6 +845,10 @@ class SupersetToDbt:
 
         Returns:
             YAML 格式的 schema 内容（兼容 Lightdash 和 dbt 规范）
+
+        生成格式说明：
+        - metrics 放在模型的 meta.metrics 层级，和 columns 分开
+        - columns 中只包含维度信息（dimension）
         """
         table_name = dataset.get("table_name", "")
         if not table_name:
@@ -857,14 +860,29 @@ class SupersetToDbt:
 
         lines = []
 
-        # 生成 x-metric-definitions（Lightdash 格式）
-        if metrics:
-            lines.append('x-metric-definitions:')
+        # 生成 models 定义
+        lines.append('version: 2')
+        lines.append('')
+        lines.append('models:')
+        lines.append(f"  - name: {table_name}")
 
-            for i, metric in enumerate(metrics):
+        # 使用 Superset 数据集的 description，如果没有则使用默认值
+        dataset_description = dataset.get("description", f"从 Superset 数据集 {table_name} 同步")
+        if dataset_description:
+            lines.append(f'    description: "{dataset_description}"')
+        else:
+            lines.append(f'    description: "从 Superset 数据集 {table_name} 同步"')
+
+        # 生成模型级别的 meta.metrics（和 columns 分开）
+        if metrics:
+            lines.append('    meta:')
+            lines.append('      metrics:')
+
+            for metric in metrics:
                 metric_name = metric.get("metric_name", "")
                 expression = metric.get("expression", "")
                 description = metric.get("description", "")
+                verbose_name = metric.get("verbose_name", "")
 
                 if not metric_name or not expression:
                     continue
@@ -882,39 +900,23 @@ class SupersetToDbt:
                 elif "MAX" in expression:
                     metric_type = "max"
 
-                # YAML anchor 引用ID
-                anchor_id = f"&id00{i + 1}"
-
-                lines.append(f'  {metric_name}: {anchor_id}')
-                lines.append(f'    type: {metric_type}')
+                lines.append(f'        {metric_name}:')
+                lines.append(f'          type: {metric_type}')
 
                 # 处理 SQL 表达式 - 如果包含换行符或特殊字符，使用 YAML 的字面量块样式
                 sql_cleaned = expression.strip()
                 if '\n' in sql_cleaned or "'" in sql_cleaned or '"' in sql_cleaned:
                     # 使用字面量块样式（|）保留换行和引号
-                    lines.append('    sql: |')
+                    lines.append('          sql: |')
                     for line in sql_cleaned.split('\n'):
-                        lines.append(f'      {line}')
+                        lines.append(f'            {line}')
                 else:
-                    lines.append(f'    sql: {sql_cleaned}')
+                    lines.append(f'          sql: {sql_cleaned}')
 
-                if description:
-                    lines.append(f'    description: {description}')
-
-            lines.append('')
-
-        # 生成 models 定义
-        lines.append('version: 2')
-        lines.append('')
-        lines.append('models:')
-        lines.append(f"  - name: {table_name}")
-
-        # 使用 Superset 数据集的 description，如果没有则使用默认值
-        dataset_description = dataset.get("description", f"从 Superset 数据集 {table_name} 同步")
-        if dataset_description:
-            lines.append(f'    description: "{dataset_description}"')
-        else:
-            lines.append(f'    description: "从 Superset 数据集 {table_name} 同步"')
+                # 优先使用 verbose_name 作为 description
+                metric_desc = verbose_name or description
+                if metric_desc:
+                    lines.append(f'          description: "{metric_desc}"')
 
         # 生成 computed_columns（dbt 规范）
         if calculated_columns:
@@ -934,24 +936,9 @@ class SupersetToDbt:
                 lines.append(f'        type: {col_type.lower() if col_type else "number"}')
                 lines.append(f'        sql: {expression}')
 
+        # 生成 columns（只包含维度信息，不包含 metrics）
         if physical_columns:
             lines.append('    columns:')
-
-            # 构建列名到度量类型的映射
-            col_metrics_map = {}
-            for i, metric in enumerate(metrics):
-                expression = metric.get("expression", "")
-                metric_name = metric.get("metric_name", "")
-                anchor_ref = f"*id00{i + 1}"
-
-                # 从表达式中提取引用的列名
-                import re
-                match = re.search(r'\b(\w+)\s*\)$', expression)
-                if match:
-                    col_name_ref = match.group(1)
-                    if col_name_ref not in col_metrics_map:
-                        col_metrics_map[col_name_ref] = []
-                    col_metrics_map[col_name_ref].append((metric_name, anchor_ref))
 
             for col in physical_columns:
                 col_name = col.get("column_name", "")
@@ -973,12 +960,6 @@ class SupersetToDbt:
                 lines.append('          dimension:')
                 lines.append(f'            type: {dbt_type}')
                 lines.append(f'            label: null')
-
-                # 度量配置（如果该列有相关度量）
-                if col_name in col_metrics_map:
-                    lines.append('          metrics:')
-                    for metric_name, anchor_ref in col_metrics_map[col_name]:
-                        lines.append(f'            {metric_name}: {anchor_ref}')
 
         # 处理计算列（添加到 columns 中，使用 meta.superset 扩展）
         if calculated_columns:
