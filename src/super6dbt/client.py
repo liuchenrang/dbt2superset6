@@ -432,8 +432,19 @@ class SupersetClient:
         title: Optional[str] = None,
         description: Optional[str] = None,
         params: Optional[Dict[str, Any]] = None,
+        dashboard_id: Optional[int] = None,
+        owner_id: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
-        """更新图表"""
+        """更新图表
+
+        Args:
+            chart_id: 图表ID
+            title: 图表标题
+            description: 描述
+            params: 图表参数字典
+            dashboard_id: 关联的面板ID
+            owner_id: 所有者ID
+        """
         payload = {}
         if title is not None:
             payload["slice_name"] = title  # 使用 slice_name 而不是 title
@@ -446,35 +457,146 @@ class SupersetClient:
                 import json
                 params_dict = json.loads(params)
             else:
-                params_dict = params
+                params_dict = params.copy()
+
+            # 提取 datasource_id
+            datasource_str = params_dict.get("datasource", "")
+            datasource_id = int(datasource_str.split("__")[0]) if "__" in datasource_str else int(datasource_str) if datasource_str else None
 
             # 将 viz_type 同步到图表对象层级
             viz_type = params_dict.get("viz_type")
             if viz_type:
                 payload["viz_type"] = viz_type
 
-            # 构建 query_context (Superset 需要它来执行查询)
-            # query_context 中的 form_data 应该与 params 保持一致
+            # 设置顶层必需字段
+            payload["datasource_id"] = datasource_id
+            payload["datasource_type"] = "table"
+
+            # 设置 dashboards 和 owners
+            if dashboard_id:
+                payload["dashboards"] = [dashboard_id]
+                params_dict["dashboards"] = [dashboard_id]
+            if owner_id:
+                payload["owners"] = [owner_id]
+
+            # 构建 queries 数组
+            # 参考: chart_rules.py 中的 QUERY_CONTEXT_RULES
+            query_item = {
+                "filters": [],
+                "extras": {"having": "", "where": ""},  # 注意: line 类型不应包含 time_grain_sqla
+                "applied_time_extras": {},
+                "annotation_layers": [],
+                "series_limit": 0,
+                "group_others_when_limit_reached": False,
+                "order_desc": True,
+                "url_params": {},
+                "custom_params": {},
+                "custom_form_data": {},
+                "post_processing": []
+            }
+
+            # 处理 metrics/metric
+            # 规则: Pie 和 Big Number 使用 metric (单数), Line 使用 metrics (数组)
+            metric_name = None
+            metrics_list = []
+            if params_dict.get("metric"):
+                metric_name = params_dict.get("metric")
+                metrics_list = [metric_name]
+                query_item["metrics"] = metrics_list
+            elif params_dict.get("metrics"):
+                metrics = params_dict.get("metrics")
+                query_item["metrics"] = metrics
+                metrics_list = metrics if isinstance(metrics, list) else [metrics]
+                if metrics:
+                    metric_name = metrics[0] if isinstance(metrics[0], str) else metrics[0].get("label") or metrics[0].get("column", {}).get("column_name")
+
+            # ==================== 图表类型特定处理 ====================
+
+            # 处理折线图时间序列 (echarts_timeseries_line)
+            # 规则: 必须移除 time_grain_sqla, PostgreSQL 不支持 week grain
+            if viz_type == "echarts_timeseries_line":
+                time_column = params_dict.get("granularity_sqla") or params_dict.get("x_axis")
+                groupby = params_dict.get("groupby", [])
+
+                # 规则: 移除 time_grain_sqla - PostgreSQL 不支持，会导致 "No grain spec for week" 错误
+                params_dict.pop("time_grain_sqla", None)
+
+                if time_column:
+                    # 规则: 必须设置 time_range
+                    query_item["time_range"] = "No filter"
+
+                    # 设置 granularity
+                    query_item["granularity"] = time_column
+
+                    # 规则: columns 使用简单字符串数组，不使用 timeGrain 对象
+                    # 格式: [维度列, 时间列]
+                    columns = []
+                    for dim in groupby:
+                        columns.append(dim)
+                    columns.append(time_column)
+                    query_item["columns"] = columns
+
+                    # 规则: 设置 series_columns
+                    if groupby:
+                        query_item["series_columns"] = groupby
+
+                # 规则: 设置 orderby 格式为 [[metric_name, False]]
+                if metric_name:
+                    query_item["orderby"] = [[metric_name, False]]
+
+                # 规则: 设置 post_processing (pivot, rename, flatten)
+                if groupby and metric_name and time_column:
+                    query_item["post_processing"] = [
+                        {
+                            "operation": "pivot",
+                            "options": {
+                                "index": [time_column],
+                                "columns": groupby,
+                                "aggregates": {metric_name: {"operator": "mean"}},
+                                "drop_missing_columns": False
+                            }
+                        },
+                        {
+                            "operation": "rename",
+                            "options": {"columns": {metric_name: None}, "level": 0, "inplace": True}
+                        },
+                        {"operation": "flatten"}
+                    ]
+
+            else:
+                # 非折线图的处理
+                # 规则: groupby 用于 Pie/Bar 等，all_columns 用于 Table
+                if params_dict.get("groupby"):
+                    query_item["columns"] = params_dict.get("groupby")
+
+                if params_dict.get("all_columns"):
+                    query_item["columns"] = params_dict.get("all_columns")
+
+                # 规则: Pie 图表必须设置 orderby
+                if metric_name and viz_type == "pie":
+                    query_item["orderby"] = [[metric_name, False]]
+
+            # 处理 adhoc_filters
+            if params_dict.get("adhoc_filters"):
+                for adhoc_filter in params_dict.get("adhoc_filters"):
+                    if adhoc_filter.get("operator") == "TEMPORAL_RANGE":
+                        query_item["filters"].append({
+                            "col": adhoc_filter.get("subject"),
+                            "op": "TEMPORAL_RANGE",
+                            "val": adhoc_filter.get("comparator", "No filter")
+                        })
+
+            # 处理 row_limit
+            query_item["row_limit"] = params_dict.get("row_limit", 10000 if viz_type == "echarts_timeseries_line" else 100)
+
+            # 构建 query_context
             query_context = {
                 "datasource": {
-                    "id": params_dict.get("datasource", "").split("__")[0] if params_dict.get("datasource") else None,
+                    "id": datasource_id,
                     "type": "table"
                 },
                 "force": False,
-                "queries": [{
-                    "filters": [],
-                    "extras": {"having": "", "where": ""},
-                    "applied_time_extras": {},
-                    "columns": [],
-                    "metrics": [params_dict.get("metric")] if params_dict.get("metric") else params_dict.get("metrics", []),
-                    "annotation_layers": [],
-                    "series_limit": 0,
-                    "group_others_when_limit_reached": False,
-                    "order_desc": True,
-                    "url_params": {},
-                    "custom_params": {},
-                    "custom_form_data": {}
-                }],
+                "queries": [query_item],
                 "form_data": params_dict.copy(),
                 "result_format": "json",
                 "result_type": "full"

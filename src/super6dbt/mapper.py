@@ -64,8 +64,8 @@ VIZ_TYPE_MAP = {
     "table": "table",
     "number": "big_number_total",
     "big_number": "big_number_total",
-    "pie": "echarts_pie",
-    "doughnut": "echarts_pie",
+    "pie": "pie",
+    "doughnut": "pie",
     "area": "echarts_timeseries",
 }
 

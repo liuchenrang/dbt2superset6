@@ -205,7 +205,7 @@ class SupersetPusher:
 
         # 同步图表
         if exposure_meta.get("dashboard_id"):
-            self._sync_charts(exposure, exposure_meta["dashboard_id"], schema)
+            self._sync_charts(exposure, exposure_meta["dashboard_id"], schema, owner_id)
 
     def _create_dashboard(
         self, dashboard_config: Dict[str, Any], owner_id: int
@@ -239,17 +239,25 @@ class SupersetPusher:
         else:
             logger.warning(f"更新面板失败: ID {dashboard_id}")
 
-    def _sync_charts(self, exposure: Dict[str, Any], dashboard_id: int, schema: str = None) -> None:
+    def _sync_charts(self, exposure: Dict[str, Any], dashboard_id: int, schema: str = None, owner_id: int = None) -> None:
         """同步图表到面板 - 包括创建/更新图表并将其关联到面板
 
         Args:
             exposure: exposure配置
             dashboard_id: 面板ID
             schema: 指定数据集的 schema 名称（优先级最高）
+            owner_id: 图表拥有者ID
         """
         exposure_meta = exposure.get("meta", {})
         charts_config = exposure_meta.get("charts", [])
         existing_charts_map = exposure_meta.get("existing_charts", {})
+
+        # 验证 table 类型的 chart 配置
+        validation_errors = self._validate_table_charts(charts_config)
+        if validation_errors:
+            for error in validation_errors:
+                logger.error(f"Chart 配置验证失败: {error}")
+            raise ValueError(f"Chart 配置验证失败，共 {len(validation_errors)} 个错误")
 
         # 获取面板的现有图表
         dashboard = self.client.get_dashboard(dashboard_id)
@@ -268,8 +276,8 @@ class SupersetPusher:
                     if chart_id:
                         dashboard_chart_ids.add(chart_id)
 
-        # 收集需要关联的图表ID列表
-        chart_ids_to_add = []
+        # 收集需要关联的图表信息（包含 position）
+        charts_to_add = []
 
         # 处理每个图表配置
         for chart_config in charts_config:
@@ -307,36 +315,73 @@ class SupersetPusher:
             # 构建图表参数
             params = self._build_chart_params(chart_config, dataset)
 
+            # 获取 position 配置
+            position = chart_config.get("position", {})
+
+            chart_id = None
             if chart_exists and existing_chart_id:
                 # 更新现有图表
-                update_success = self._update_chart(existing_chart_id, chart_title, params, viz_type)
+                update_success = self._update_chart(existing_chart_id, chart_title, params, viz_type, dashboard_id, owner_id)
                 if update_success:
-                    chart_ids_to_add.append(existing_chart_id)
+                    chart_id = existing_chart_id
                 else:
                     # 更新失败，创建新图表
                     logger.warning(f"图表更新失败，尝试创建新图表: {chart_title}")
-                    new_chart_id = self._create_chart(
+                    chart_id = self._create_chart(
                         dataset_id, chart_title, params, viz_type, dashboard_id
                     )
-                    if new_chart_id:
-                        existing_charts_map[chart_title] = new_chart_id
-                        chart_ids_to_add.append(new_chart_id)
+                    if chart_id:
+                        existing_charts_map[chart_title] = chart_id
             else:
                 # 创建新图表
-                new_chart_id = self._create_chart(
+                chart_id = self._create_chart(
                     dataset_id, chart_title, params, viz_type, dashboard_id
                 )
-                if new_chart_id:
-                    existing_charts_map[chart_title] = new_chart_id
-                    chart_ids_to_add.append(new_chart_id)
+                if chart_id:
+                    existing_charts_map[chart_title] = chart_id
+
+            if chart_id:
+                charts_to_add.append({
+                    "id": chart_id,
+                    "title": chart_title,
+                    "viz_type": viz_type,
+                    "position": position,
+                })
 
         # 更新面板，关联所有图表
-        if chart_ids_to_add:
-            self._update_dashboard_charts(dashboard_id, chart_ids_to_add, chart_positions)
+        if charts_to_add:
+            # 传递完整的 exposure_meta 以支持 layout 配置
+            self._update_dashboard_charts(dashboard_id, charts_to_add, exposure_meta)
 
             # 更新exposure文件，保存图表ID映射
             exposure_meta["existing_charts"] = existing_charts_map
             self._update_exposure_file(exposure.get("name"), exposure)
+
+    def _validate_table_charts(self, charts_config: List[Dict[str, Any]]) -> List[str]:
+        """验证所有图表配置
+
+        基于 Superset 6.0 API 规则验证图表参数
+
+        Args:
+            charts_config: chart 配置列表
+
+        Returns:
+            错误消息列表，空列表表示验证通过
+        """
+        from .chart_rules import validate_chart_config
+
+        errors = []
+
+        for chart_config in charts_config:
+            chart_title = chart_config.get("title", "未命名图表")
+            chart_type = chart_config.get("type", "line")
+
+            # 使用规则验证
+            chart_errors = validate_chart_config(chart_type, chart_config)
+            for err in chart_errors:
+                errors.append(f"Chart '{chart_title}': {err}")
+
+        return errors
 
     def _verify_chart_exists(self, chart_id: int, dashboard_chart_ids: set = None) -> bool:
         """验证图表是否存在于 Superset
@@ -636,12 +681,38 @@ class SupersetPusher:
             params.setdefault("metric_name_font_size", 0.15)
             params.setdefault("y_axis_format", "SMART_NUMBER")
             params.setdefault("time_format", "smart_date")
+            params.setdefault("show_trend_line", False)
+            params.setdefault("start_y_axis_at_zero", True)
 
         elif chart_type == "line":
-            # 折线图配置
+            # 折线图配置 - 补全官方 API 所需字段
+            params.setdefault("row_limit", 10000)
+            params.setdefault("order_desc", True)
+            params.setdefault("truncate_metric", True)
+            params.setdefault("show_empty_columns", True)
+            params.setdefault("comparison_type", "values")
+            params.setdefault("annotation_layers", [])
+            params.setdefault("x_axis_sort_asc", True)
+            params.setdefault("sort_series_type", "sum")
+            params.setdefault("color_scheme", "SUPERSET_DEFAULT")
+            params.setdefault("time_shift_color", True)
+            params.setdefault("only_total", True)
+            params.setdefault("opacity", 0.2)
+            params.setdefault("markerSize", 6)
             params.setdefault("show_markers", True)
             params.setdefault("show_legend", True)
+            params.setdefault("legendType", "scroll")
+            params.setdefault("legendOrientation", "top")
             params.setdefault("line_interpolation", "linear")
+            params.setdefault("x_axis_time_format", "smart_date")
+            params.setdefault("xAxisLabelInterval", "auto")
+            params.setdefault("rich_tooltip", True)
+            params.setdefault("showTooltipTotal", True)
+            params.setdefault("tooltipTimeFormat", "smart_date")
+            params.setdefault("y_axis_format", "SMART_NUMBER")
+            params.setdefault("truncateXAxis", True)
+            params.setdefault("y_axis_bounds", [None, None])
+            params.setdefault("time_range", "No filter")
 
         elif chart_type == "bar":
             # 柱状图配置
@@ -650,17 +721,84 @@ class SupersetPusher:
 
         elif chart_type == "pie" or chart_type == "doughnut":
             # 饼图/环形图配置
+            # 注意：pie 使用 metric (单数字符串)，不是 metrics (数组)
+            metrics = chart_config.get("metrics", [])
+            if metrics:
+                params["metric"] = metrics[0]
+                params.pop("metrics", None)  # 移除 metrics 数组
+
+            # 设置 groupby（维度）
+            dimensions = chart_config.get("dimensions", [])
+            if dimensions:
+                params["groupby"] = dimensions
+
+            # 设置时间过滤器
+            time_column = chart_config.get("time_column")
+            if time_column:
+                params["adhoc_filters"] = [{
+                    "clause": "WHERE",
+                    "subject": time_column,
+                    "operator": "TEMPORAL_RANGE",
+                    "comparator": "No filter",
+                    "expressionType": "SIMPLE"
+                }]
+
+            # 饼图特定配置
+            params.setdefault("row_limit", 100)
+            params.setdefault("sort_by_metric", True)
             params.setdefault("show_legend", True)
             params.setdefault("label_type", "key")
+            params.setdefault("color_scheme", "SUPERSET_DEFAULT")
+            params.setdefault("show_labels", True)
+            params.setdefault("show_labels_threshold", 5)
+
             # 移除时间配置（饼图不需要）
             params.pop("granularity_sqla", None)
             params.pop("time_grain_sqla", None)
             params.pop("x_axis", None)
 
         elif chart_type == "table":
-            # 表格配置
+            # 表格配置 - Superset 要求 query_mode 必须为 raw
+            params["query_mode"] = "raw"
+
+            # 设置 all_columns (必须指定)
+            columns = chart_config.get("columns", [])
+            if columns:
+                params["all_columns"] = columns
+
+            # 设置时间过滤器 (必须指定)
+            time_column = chart_config.get("time_column")
+            if time_column:
+                params["adhoc_filters"] = [{
+                    "clause": "WHERE",
+                    "subject": time_column,
+                    "operator": "TEMPORAL_RANGE",
+                    "comparator": "No filter",
+                    "expressionType": "SIMPLE"
+                }]
+            else:
+                # 默认时间过滤器 - 使用 "No filter" 表示不过滤
+                params["adhoc_filters"] = [{
+                    "clause": "WHERE",
+                    "subject": "report_date",
+                    "operator": "TEMPORAL_RANGE",
+                    "comparator": "No filter",
+                    "expressionType": "SIMPLE"
+                }]
+
+            # 表格特定配置
             params.setdefault("server_pagination", True)
+            params.setdefault("server_page_length", 10)
             params.setdefault("order_by_cols", [])
+            params.setdefault("order_desc", True)
+            params.setdefault("table_timestamp_format", "smart_date")
+            params.setdefault("allow_render_html", True)
+            params.setdefault("show_cell_bars", True)
+            params.setdefault("percent_metrics", [])
+            params.setdefault("color_pn", True)
+            params.setdefault("include_search", True)
+            params.setdefault("table_cell_font_size", 13)
+
             # 移除时间配置
             params.pop("granularity_sqla", None)
             params.pop("time_grain_sqla", None)
@@ -701,6 +839,8 @@ class SupersetPusher:
         title: str,
         params: Dict[str, Any],
         viz_type: str,
+        dashboard_id: int = None,
+        owner_id: int = None,
     ) -> bool:
         """更新图表
 
@@ -712,6 +852,8 @@ class SupersetPusher:
             chart_id=chart_id,
             title=title,
             params=params,
+            dashboard_id=dashboard_id,
+            owner_id=owner_id,
         )
 
         if result:
@@ -724,12 +866,17 @@ class SupersetPusher:
     def _update_dashboard_charts(
         self,
         dashboard_id: int,
-        chart_ids: List[int],
-        existing_positions: Dict[str, Any] = None,
+        charts_to_add: List[Dict[str, Any]],
+        charts_config: List[Dict[str, Any]] = None,
     ) -> None:
         """更新面板关联的图表列表并构建 position_json 布局
 
-        Superset 6.0 需要正确的 position_json 结构来显示图表
+        从 exposures.yml 的 meta.layout 配置读取布局结构，生成 Superset 6.0 标准布局
+
+        Args:
+            dashboard_id: 面板ID
+            charts_to_add: 图表列表，每个包含 id, title, viz_type, position
+            charts_config: exposures.yml 中的 charts 配置
         """
         # 获取现有面板信息
         dashboard = self.client.get_dashboard(dashboard_id)
@@ -737,84 +884,315 @@ class SupersetPusher:
             logger.warning(f"无法获取面板: {dashboard_id}")
             return
 
-        # 获取所有图表信息
-        charts_info = {}
-        for chart_id in chart_ids:
-            chart = self.client.get_chart(chart_id)
-            if chart:
-                charts_info[chart_id] = {
-                    "chartId": chart_id,
-                    "slice_id": chart.get("id"),
-                    "sliceName": chart.get("slice_name"),
-                    "viz_type": chart.get("viz_type"),
-                }
+        dashboard_title = dashboard.get("dashboard_title", "Dashboard")
 
-        # 构建 Superset 6.0 兼容的 position_json
+        # 构建图表标题到 ID 的映射
+        chart_title_to_id = {c.get("title"): c.get("id") for c in charts_to_add if c.get("id")}
+
+        # 尝试从 charts_config 获取 layout 配置
+        layout_config = None
+        if charts_config:
+            # charts_config 就是 exposure meta
+            layout_config = charts_config.get("layout") if isinstance(charts_config, dict) else None
+
+        # 如果有 layout 配置，使用 layout 构建 position_json
+        if layout_config:
+            position_json = self._build_position_json_from_layout(
+                layout_config, chart_title_to_id, dashboard_title
+            )
+        else:
+            # 兼容旧版本：使用默认布局
+            position_json = self._build_default_position_json(charts_to_add, dashboard_title)
+
+        # 更新面板
+        result = self.client.update_dashboard(dashboard_id, positions=position_json)
+
+        if result:
+            logger.info(f"图表已关联到面板 ID {dashboard_id}, 图表数量: {len(charts_to_add)}")
+        else:
+            logger.warning(f"面板布局更新失败，但图表已创建")
+
+    def _build_position_json_from_layout(
+        self,
+        layout_config: List[Dict[str, Any]],
+        chart_title_to_id: Dict[str, int],
+        dashboard_title: str
+    ) -> Dict[str, Any]:
+        """从 exposures.yml 的 layout 配置构建 position_json
+
+        支持的布局组件:
+        - header: 标题组件
+        - row: 行容器
+        - column: 列容器
+        - chart: 图表组件
+        - markdown: Markdown 文本组件
+        - divider: 分隔线组件
+
+        Args:
+            layout_config: layout 配置列表
+            chart_title_to_id: 图表标题到 ID 的映射
+            dashboard_title: Dashboard 标题
+
+        Returns:
+            Superset 6.0 标准的 position_json
+        """
+        import uuid
+
         position_json = {
             "DASHBOARD_VERSION_KEY": "v2",
             "ROOT_ID": {
-                "id": "ROOT",
-                "type": "ROOT",
-                "children": ["TABS-0"],
+                "children": ["GRID_ID"],
+                "id": "ROOT_ID",
+                "type": "ROOT"
             },
-            "TABS-0": {
-                "id": "TABS-0",
-                "type": "TAB",
+            "GRID_ID": {
                 "children": [],
-                "meta": {"text": "Tab 1"}
-            },
-            "CHART-UUID": {},
+                "id": "GRID_ID",
+                "parents": ["ROOT_ID"],
+                "type": "GRID"
+            }
         }
 
-        # 布局配置
-        KPI_ROW_SIZE = 3  # KPI 每行8个，每个占3个单位宽度
-        CHART_ROW_SIZE = 6  # 图表每行2个，每个占6个单位宽度
+        grid_children = []
 
-        # 添加 KPI 图表（前8个）
-        kpi_chart_ids = chart_ids[:8]
-        for i, chart_id in enumerate(kpi_chart_ids):
-            col = i * KPI_ROW_SIZE
-            row = 0
-            position_json["TABS-0"]["children"].append(str(chart_id))
-            position_json["CHART-UUID"][str(chart_id)] = str(chart_id)
-            position_json[str(chart_id)] = {
-                "id": chart_id,
-                "type": "CHART",
-                "meta": charts_info.get(chart_id, {}),
-                "position": {
-                    "x": col,
-                    "y": row * 6,  # 每行高度为6
-                    "w": KPI_ROW_SIZE,
-                    "h": 4,
+        for item in layout_config:
+            item_type = item.get("type")
+
+            if item_type == "header":
+                # Header 组件
+                position_json["HEADER_ID"] = {
+                    "id": "HEADER_ID",
+                    "meta": {
+                        "text": item.get("text", dashboard_title)
+                    },
+                    "type": "HEADER"
+                }
+
+            elif item_type == "row":
+                # Row 组件
+                row_id = f"ROW-{uuid.uuid4().hex[:20]}"
+                row_children = []
+                row_background = item.get("background", "transparent").upper()
+                if not row_background.startswith("BACKGROUND_"):
+                    row_background = f"BACKGROUND_{row_background}"
+
+                for child in item.get("children", []):
+                    child_type = child.get("type")
+
+                    if child_type == "chart":
+                        chart_ref = child.get("ref")
+                        chart_id = chart_title_to_id.get(chart_ref)
+
+                        if chart_id:
+                            component_id = f"CHART-X-{uuid.uuid4().hex[:20]}"
+                            chart_uuid = str(uuid.uuid4())
+
+                            width = child.get("width", 4)
+                            height = child.get("height", 50)
+
+                            position_json[component_id] = {
+                                "children": [],
+                                "id": component_id,
+                                "meta": {
+                                    "chartId": chart_id,
+                                    "height": height,
+                                    "sliceName": chart_ref,
+                                    "uuid": chart_uuid,
+                                    "width": width
+                                },
+                                "parents": ["ROOT_ID", "GRID_ID", row_id],
+                                "type": "CHART"
+                            }
+                            row_children.append(component_id)
+                        else:
+                            logger.warning(f"图表 '{chart_ref}' 未找到对应的 ID")
+
+                    elif child_type == "markdown":
+                        # Markdown 组件
+                        md_id = f"MARKDOWN-{uuid.uuid4().hex[:20]}"
+                        md_content = child.get("content", "")
+
+                        position_json[md_id] = {
+                            "children": [],
+                            "id": md_id,
+                            "meta": {
+                                "code": md_content,
+                                "height": child.get("height", 50),
+                                "width": child.get("width", 4)
+                            },
+                            "parents": ["ROOT_ID", "GRID_ID", row_id],
+                            "type": "MARKDOWN"
+                        }
+                        row_children.append(md_id)
+
+                    elif child_type == "divider":
+                        # Divider 组件
+                        divider_id = f"DIVIDER-{uuid.uuid4().hex[:20]}"
+
+                        position_json[divider_id] = {
+                            "children": [],
+                            "id": divider_id,
+                            "meta": {
+                                "height": child.get("height", 10),
+                                "width": child.get("width", 12)
+                            },
+                            "parents": ["ROOT_ID", "GRID_ID", row_id],
+                            "type": "DIVIDER"
+                        }
+                        row_children.append(divider_id)
+
+                    elif child_type == "column":
+                        # Column 组件（嵌套布局）
+                        col_id = f"COLUMN-{uuid.uuid4().hex[:20]}"
+                        col_children = []
+
+                        for col_child in child.get("children", []):
+                            if col_child.get("type") == "chart":
+                                chart_ref = col_child.get("ref")
+                                chart_id = chart_title_to_id.get(chart_ref)
+
+                                if chart_id:
+                                    component_id = f"CHART-X-{uuid.uuid4().hex[:20]}"
+                                    chart_uuid = str(uuid.uuid4())
+
+                                    position_json[component_id] = {
+                                        "children": [],
+                                        "id": component_id,
+                                        "meta": {
+                                            "chartId": chart_id,
+                                            "height": col_child.get("height", 50),
+                                            "sliceName": chart_ref,
+                                            "uuid": chart_uuid,
+                                            "width": col_child.get("width", 4)
+                                        },
+                                        "parents": ["ROOT_ID", "GRID_ID", row_id, col_id],
+                                        "type": "CHART"
+                                    }
+                                    col_children.append(component_id)
+
+                        position_json[col_id] = {
+                            "children": col_children,
+                            "id": col_id,
+                            "meta": {
+                                "background": "BACKGROUND_TRANSPARENT",
+                                "width": child.get("width", 6)
+                            },
+                            "parents": ["ROOT_ID", "GRID_ID", row_id],
+                            "type": "COLUMN"
+                        }
+                        row_children.append(col_id)
+
+                position_json[row_id] = {
+                    "children": row_children,
+                    "id": row_id,
+                    "meta": {
+                        "background": row_background
+                    },
+                    "type": "ROW"
+                }
+                grid_children.append(row_id)
+
+            elif item_type == "divider":
+                # 顶层 Divider
+                divider_id = f"DIVIDER-{uuid.uuid4().hex[:20]}"
+
+                position_json[divider_id] = {
+                    "children": [],
+                    "id": divider_id,
+                    "meta": {
+                        "height": item.get("height", 10),
+                        "width": item.get("width", 12)
+                    },
+                    "parents": ["ROOT_ID", "GRID_ID"],
+                    "type": "DIVIDER"
+                }
+                grid_children.append(divider_id)
+
+            elif item_type == "markdown":
+                # 顶层 Markdown
+                md_id = f"MARKDOWN-{uuid.uuid4().hex[:20]}"
+
+                position_json[md_id] = {
+                    "children": [],
+                    "id": md_id,
+                    "meta": {
+                        "code": item.get("content", ""),
+                        "height": item.get("height", 50),
+                        "width": item.get("width", 12)
+                    },
+                    "parents": ["ROOT_ID", "GRID_ID"],
+                    "type": "MARKDOWN"
+                }
+                grid_children.append(md_id)
+
+        # 设置 GRID_ID 的 children
+        position_json["GRID_ID"]["children"] = grid_children
+
+        return position_json
+
+    def _build_default_position_json(
+        self,
+        charts_to_add: List[Dict[str, Any]],
+        dashboard_title: str
+    ) -> Dict[str, Any]:
+        """构建默认的 position_json（兼容旧版本）"""
+        import uuid
+
+        row_id = f"ROW-{uuid.uuid4().hex[:20]}"
+
+        position_json = {
+            "DASHBOARD_VERSION_KEY": "v2",
+            "ROOT_ID": {
+                "children": ["GRID_ID"],
+                "id": "ROOT_ID",
+                "type": "ROOT"
+            },
+            "GRID_ID": {
+                "children": [row_id],
+                "id": "GRID_ID",
+                "parents": ["ROOT_ID"],
+                "type": "GRID"
+            },
+            "HEADER_ID": {
+                "id": "HEADER_ID",
+                "meta": {
+                    "text": dashboard_title
                 },
-            }
-
-        # 添加其他图表（每行2个）
-        for idx, chart_id in enumerate(chart_ids[8:], start=0):
-            row = 1 + idx // 2
-            col = (idx % 2) * CHART_ROW_SIZE
-
-            position_json["TABS-0"]["children"].append(str(chart_id))
-            position_json["CHART-UUID"][str(chart_id)] = str(chart_id)
-            position_json[str(chart_id)] = {
-                "id": chart_id,
-                "type": "CHART",
-                "meta": charts_info.get(chart_id, {}),
-                "position": {
-                    "x": col,
-                    "y": row * 8,  # 每行高度为8
-                    "w": CHART_ROW_SIZE,
-                    "h": 6,
+                "type": "HEADER"
+            },
+            row_id: {
+                "children": [],
+                "id": row_id,
+                "meta": {
+                    "background": "BACKGROUND_TRANSPARENT"
                 },
+                "type": "ROW"
             }
+        }
 
-        # 更新面板的 position_json
-        self.client.update_dashboard(
-            dashboard_id=dashboard_id,
-            positions=position_json
-        )
+        for chart in charts_to_add:
+            chart_id = chart.get("id")
+            chart_title = chart.get("title", "")
 
-        logger.info(f"图表已关联到面板 ID {dashboard_id}, 图表数量: {len(chart_ids)}")
+            component_id = f"CHART-X-{uuid.uuid4().hex[:20]}"
+            chart_uuid = str(uuid.uuid4())
+
+            position_json[component_id] = {
+                "children": [],
+                "id": component_id,
+                "meta": {
+                    "chartId": chart_id,
+                    "height": 50,
+                    "sliceName": chart_title,
+                    "uuid": chart_uuid,
+                    "width": 4
+                },
+                "parents": ["ROOT_ID", "GRID_ID", row_id],
+                "type": "CHART"
+            }
+            position_json[row_id]["children"].append(component_id)
+
+        return position_json
 
     def _update_exposure_file(self, exposure_name: str, exposure: Dict[str, Any]) -> None:
         """更新exposure文件
