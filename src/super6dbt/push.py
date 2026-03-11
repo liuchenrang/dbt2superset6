@@ -1350,6 +1350,33 @@ class SupersetPusher:
 
                         metrics_to_add.append(metric_obj)
 
+            # 处理表级 metrics (meta.metrics)
+            if model_meta.metrics:
+                for metric_name, metric_config in model_meta.metrics.items():
+                    # 构建 SQL 表达式
+                    if metric_config.sql:
+                        raw_sql = metric_config.sql.strip()
+                        # 表级 metrics 的 sql 通常已包含聚合函数
+                        sql_expr = raw_sql
+                    else:
+                        logger.warning(f"表级 metric {metric_name} 缺少 sql 表达式，跳过")
+                        continue
+
+                    # 构建指标对象
+                    metric_obj = {
+                        "metric_name": metric_name,
+                        "verbose_name": metric_config.description or metric_name,
+                        "expression": sql_expr,
+                        "description": metric_config.description or "",
+                    }
+
+                    # 如果指标已存在，保留其 ID
+                    if metric_name in existing_metrics:
+                        metric_obj["id"] = existing_metrics[metric_name].get("id")
+                        metric_obj["uuid"] = existing_metrics[metric_name].get("uuid")
+
+                    metrics_to_add.append(metric_obj)
+
             # 更新数据集指标
             if metrics_to_add:
                 new_metrics.extend(metrics_to_add)

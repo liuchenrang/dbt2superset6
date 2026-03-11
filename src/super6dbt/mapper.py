@@ -117,12 +117,15 @@ class ModelMeta:
     description: str = ""
     columns: Dict[str, ColumnMeta] = None
     computed_columns: Optional[Dict[str, ComputedColumn]] = None
+    metrics: Optional[Dict[str, MetricConfig]] = None  # 表级 metrics
 
     def __post_init__(self):
         if self.columns is None:
             self.columns = {}
         if self.computed_columns is None:
             self.computed_columns = {}
+        if self.metrics is None:
+            self.metrics = {}
 
 
 class DbtToSuperset:
@@ -187,6 +190,17 @@ class DbtToSuperset:
                     sql=computed.get("sql", ""),
                     description=computed.get("description", ""),
                     verbose_name=computed.get("verbose_name", col_name),
+                )
+
+        # 解析表级 meta.metrics
+        model_meta_config = model_data.get("meta", {})
+        if "metrics" in model_meta_config:
+            for metric_name, metric_config in model_meta_config["metrics"].items():
+                meta.metrics[metric_name] = MetricConfig(
+                    name=metric_name,
+                    type=metric_config.get("type", ""),
+                    description=metric_config.get("description", ""),
+                    sql=metric_config.get("sql", ""),
                 )
 
         return meta
