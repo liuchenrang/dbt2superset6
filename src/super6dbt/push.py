@@ -1297,6 +1297,14 @@ class SupersetPusher:
             existing_metrics = {m.get("metric_name"): m for m in dataset.get("metrics", [])}
             existing_columns = {c.get("column_name"): c for c in dataset.get("columns", [])}
 
+            # 检查数据集是否有列信息
+            if not existing_columns:
+                logger.warning(
+                    f"数据集 {model_name} (ID: {dataset_id}) 没有列信息。"
+                    f"可能原因：(1) 数据库表不存在 (2) schema 配置错误 (3) Superset 列同步失败。"
+                    f"跳过列描述同步，仅同步 metrics。"
+                )
+
             # 构建新的指标列表
             new_metrics = []
             metrics_to_add = []
@@ -1382,9 +1390,12 @@ class SupersetPusher:
                 new_metrics.extend(metrics_to_add)
 
                 # 调用 API 更新数据集指标和列描述
-                self._update_dataset_with_metrics_and_columns(dataset_id, new_metrics, model_meta, existing_columns)
+                success = self._update_dataset_with_metrics_and_columns(dataset_id, new_metrics, model_meta, existing_columns)
 
-                logger.info(f"数据集 {model_name} (ID: {dataset_id}) 同步了 {len(metrics_to_add)} 个指标和列描述")
+                if success:
+                    logger.info(f"数据集 {model_name} (ID: {dataset_id}) 同步了 {len(metrics_to_add)} 个指标和列描述")
+                else:
+                    logger.error(f"数据集 {model_name} (ID: {dataset_id}) 同步失败")
 
     def _update_dataset_metrics(self, dataset_id: int, metrics: List[Dict[str, Any]]) -> bool:
         """更新数据集的指标定义
@@ -1507,27 +1518,36 @@ class SupersetPusher:
         calculated_names = {c["column_name"] for c in calculated_columns}
 
         # 构建 columns 信息（区分物理列和计算列）
+        # 关键修复：只更新已存在的列，避免 422 "columns already exist" 错误
         clean_columns = []
         for col_name, col_meta in model_meta.columns.items():
             # 如果是计算列，则跳过（后续单独处理）
             if col_name in calculated_names:
                 continue
 
-            col_obj = {}
+            # 关键修复：只处理已存在于数据集中的列，避免尝试创建已存在的列
+            if col_name not in existing_columns:
+                logger.debug(f"列 '{col_name}' 在数据集中不存在，跳过同步")
+                continue
 
-            # 从现有列中保留必要字段（包含 id）
-            if col_name in existing_columns:
-                existing_col = existing_columns[col_name]
-                if not existing_col.get("expression"):  # 只处理物理列
-                    col_obj["id"] = existing_col.get("id")
-                    if "type" in existing_col:
-                        col_obj["type"] = existing_col["type"]
-                    if "is_dttm" in existing_col:
-                        col_obj["is_dttm"] = existing_col["is_dttm"]
-                    if "filterable" in existing_col:
-                        col_obj["filterable"] = existing_col["filterable"]
+            existing_col = existing_columns[col_name]
+            # 跳过已有的计算列（expression 非空）
+            if existing_col.get("expression"):
+                continue
 
-            col_obj["column_name"] = col_name
+            # 必须包含 ID，否则 Superset 会尝试创建新列
+            col_obj = {
+                "id": existing_col.get("id"),
+                "column_name": col_name,
+            }
+
+            # 保留现有的类型信息
+            if "type" in existing_col:
+                col_obj["type"] = existing_col["type"]
+            if "is_dttm" in existing_col:
+                col_obj["is_dttm"] = existing_col["is_dttm"]
+            if "filterable" in existing_col:
+                col_obj["filterable"] = existing_col["filterable"]
 
             # 使用列的 description 作为 verbose_name
             if col_meta.description:

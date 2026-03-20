@@ -982,42 +982,173 @@ class SupersetClient:
             return response.json().get("result")
         return None
 
-    def find_dataset_by_name(self, table_name: str) -> Optional[Dict[str, Any]]:
+    def fetch_columns_from_database(self, table_name: str, schema: str, database_name: str = None) -> Optional[List[Dict[str, Any]]]:
+        """直接从数据库获取表的列信息
+
+        使用 Superset 的 /api/v1/database/{id}/table_metadata/ API 获取列信息。
+        该 API 支持 JWT token 认证。
+
+        Args:
+            table_name: 表名
+            schema: schema 名称
+            database_name: 数据库名称（可选，默认使用配置中的数据库）
+
+        Returns:
+            列信息列表，失败返回 None
+        """
+        if not database_name:
+            database_name = self.database_name
+
+        if not database_name:
+            logger.warning("未配置数据库名称，无法获取列信息")
+            return None
+
+        logger.debug(f"从数据库获取列信息: {database_name}.{schema}.{table_name}")
+
+        # 1. 获取数据库 ID
+        db_id = self._get_database_id(database_name)
+        if not db_id:
+            logger.warning(f"未找到数据库: {database_name}")
+            return None
+
+        # 2. 调用 table_metadata API 获取列信息
+        params = {
+            "name": table_name,
+            "schema": schema,
+        }
+
+        response = self._request("GET", f"/api/v1/database/{db_id}/table_metadata/", params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            columns = data.get("columns", [])
+            if columns:
+                # 转换为标准格式
+                result = []
+                for col in columns:
+                    result.append({
+                        "name": col.get("name"),
+                        "type": col.get("type"),
+                        "longType": col.get("longType"),
+                        "comment": col.get("comment"),
+                    })
+                logger.debug(f"获取到 {len(result)} 列")
+                return result
+
+        logger.warning(f"获取列信息失败: {response.status_code}, 响应: {response.text[:200]}")
+        return None
+
+    def _get_database_id(self, database_name: str) -> Optional[int]:
+        """获取数据库 ID
+
+        Args:
+            database_name: 数据库名称
+
+        Returns:
+            数据库 ID，未找到返回 None
+        """
+        params = {
+            "q": json.dumps({"filters": [{"col": "database_name", "opr": "eq", "value": database_name}]})
+        }
+        response = self._request("GET", "/api/v1/database/", params=params)
+
+        if response.status_code == 200:
+            results = response.json().get("result", [])
+            if results:
+                return results[0].get("id")
+        return None
+
+    def refresh_dataset(self, dataset_id: int) -> bool:
+        """刷新数据集，从数据库同步列信息
+
+        Args:
+            dataset_id: 数据集 ID
+
+        Returns:
+            是否刷新成功
+        """
+        # 尝试多种方式刷新数据集
+        # 方式1: POST /api/v1/dataset/{id}/refresh
+        response = self._request("POST", f"/api/v1/dataset/{dataset_id}/refresh")
+        if response.status_code == 200:
+            logger.debug(f"刷新数据集成功: {dataset_id}")
+            return True
+
+        # 方式2: PUT /api/v1/dataset/{id} 空请求体（部分 Superset 版本）
+        if response.status_code == 405:
+            logger.debug(f"POST /refresh 返回 405，尝试 PUT 方式...")
+            # 获取新的 CSRF token
+            csrf_resp = self._request("GET", "/api/v1/security/csrf_token/")
+            if csrf_resp.status_code == 200:
+                csrf_token = csrf_resp.json().get("result")
+                if csrf_token:
+                    self.csrf_token = csrf_token
+                    logger.debug(f"获取到新的 CSRF token")
+
+            # 先获取当前数据集信息
+            current = self.get_dataset(dataset_id)
+            if current:
+                # 只更新必要字段，触发列刷新
+                payload = {
+                    "schema": current.get("schema"),
+                    "table_name": current.get("table_name"),
+                }
+                response = self._request("PUT", f"/api/v1/dataset/{dataset_id}", json=payload)
+                if response.status_code == 200:
+                    logger.debug(f"刷新数据集成功(PUT): {dataset_id}")
+                    return True
+
+        # 打印错误详情
+        logger.warning(f"刷新数据集失败: {response.status_code}, 响应: {response.text[:500]}")
+        return False
+
+    def find_dataset_by_name(self, table_name: str, schema: str = None) -> Optional[Dict[str, Any]]:
         """直接通过名称搜索数据集（不获取全部列表）
 
         使用 Superset API 的 filters 功能直接搜索，避免获取所有数据集列表。
 
         Args:
             table_name: 数据集名称（表名）
+            schema: 可选的 schema 名称，用于精确匹配
 
         Returns:
             数据集详情（包含列信息），未找到返回 None
         """
+        # 构建 filters
+        filters = [{"col": "table_name", "opr": "eq", "value": table_name}]
+        if schema:
+            filters.append({"col": "schema", "opr": "eq", "value": schema})
+
         # 使用 filters 直接搜索
         params = {
-            "q": f'{{"filters":[{{"col":"table_name","opr":"eq","value":"{table_name}"}}]}}'
+            "q": f'{{"filters":{json.dumps(filters)}}}'
         }
+        logger.debug(f"查找数据集: table_name={table_name}, schema={schema}, filters={filters}")
         response = self._request("GET", "/api/v1/dataset/", params=params)
 
         if response.status_code == 200:
             data = response.json()
             results = data.get("result", [])
+            logger.debug(f"找到 {len(results)} 个匹配的数据集")
             if results:
                 # 获取完整的数据集详情（包含列信息）
                 dataset_id = results[0].get("id")
+                actual_schema = results[0].get("schema")
+                logger.debug(f"匹配到数据集 ID: {dataset_id}, schema: {actual_schema}")
                 if dataset_id:
                     return self.get_dataset(dataset_id)
         return None
 
-    def get_dataset_by_name(self, name: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
+    def get_dataset_by_name(self, name: str, schema: str = None, use_cache: bool = True) -> Optional[Dict[str, Any]]:
         """通过名称获取数据集（包含列信息）
 
         Args:
             name: 数据集名称（表名）
+            schema: 可选的 schema 名称，用于精确匹配
             use_cache: 是否使用缓存
         """
-        # 优先使用名称缓存
-        if use_cache and self._datasets_by_name is not None:
+        # 优先使用名称缓存（仅在未指定 schema 时使用缓存）
+        if use_cache and schema is None and self._datasets_by_name is not None:
             if name in self._datasets_by_name:
                 dataset = self._datasets_by_name[name]
                 dataset_id = dataset.get("id")
@@ -1025,7 +1156,7 @@ class SupersetClient:
                     return self.get_dataset(dataset_id)
 
         # 直接通过名称搜索，避免获取全部列表
-        dataset = self.find_dataset_by_name(name)
+        dataset = self.find_dataset_by_name(name, schema=schema)
         if dataset:
             return dataset
 
@@ -1041,16 +1172,92 @@ class SupersetClient:
             schema: 指定数据集的 schema 名称（优先级最高）
 
         Returns:
-            数据集信息
+            数据集信息（包含 columns）
         """
-        # 先尝试获取
-        dataset = self.get_dataset_by_name(table_name)
+        # 先尝试获取（传递 schema 进行精确匹配）
+        dataset = self.get_dataset_by_name(table_name, schema=schema)
         if dataset:
+            dataset_id = dataset.get("id")
+            columns = dataset.get("columns", [])
+            actual_schema = dataset.get("schema") or schema
+
+            # 如果数据集存在但没有列信息，尝试从数据库获取
+            if not columns and dataset_id and actual_schema:
+                logger.info(f"数据集 {table_name} (ID: {dataset_id}) 没有列信息，从数据库获取...")
+
+                # 使用 external_metadata_by_name API 获取列信息
+                db_columns = self.fetch_columns_from_database(table_name, actual_schema)
+                if db_columns:
+                    logger.info(f"从数据库获取到 {len(db_columns)} 列，更新数据集...")
+                    # 更新数据集的列信息
+                    if self._update_dataset_columns(dataset_id, db_columns):
+                        # 重新获取完整信息
+                        refreshed_dataset = self.get_dataset(dataset_id)
+                        if refreshed_dataset:
+                            return refreshed_dataset
+                else:
+                    logger.warning(f"无法从数据库获取列信息")
+
             return dataset
 
         # 不存在则创建
         logger.info(f"数据集 {table_name} 不存在，尝试创建...")
-        return self.create_dataset(table_name, schema=schema)
+        result = self.create_dataset(table_name, schema=schema)
+
+        # 关键修复：创建后刷新并重新获取完整信息（包含 columns）
+        # POST API 返回的结果不包含 columns，需要刷新后通过 GET 获取
+        if result:
+            dataset_id = result.get("id")
+            if dataset_id:
+                # 使用 external_metadata_by_name API 获取列信息
+                actual_schema = schema or self.default_schema
+                if actual_schema:
+                    db_columns = self.fetch_columns_from_database(table_name, actual_schema)
+                    if db_columns:
+                        self._update_dataset_columns(dataset_id, db_columns)
+                # 重新获取完整信息
+                full_dataset = self.get_dataset(dataset_id)
+                if full_dataset:
+                    return full_dataset
+
+        return result
+
+    def _update_dataset_columns(self, dataset_id: int, columns: List[Dict[str, Any]]) -> bool:
+        """更新数据集的列信息
+
+        Args:
+            dataset_id: 数据集 ID
+            columns: 列信息列表
+
+        Returns:
+            是否更新成功
+        """
+        # 获取 CSRF token
+        csrf_resp = self._request("GET", "/api/v1/security/csrf_token/")
+        if csrf_resp.status_code == 200:
+            csrf_token = csrf_resp.json().get("result")
+            if csrf_token:
+                self.csrf_token = csrf_token
+
+        # 转换列格式为 Superset 需要的格式
+        formatted_columns = []
+        for col in columns:
+            formatted_columns.append({
+                "column_name": col.get("name"),
+                "type": col.get("type"),
+                "is_dttm": col.get("is_dttm", False),
+                "description": col.get("description", ""),
+            })
+
+        payload = {"columns": formatted_columns}
+        response = self._request("PUT", f"/api/v1/dataset/{dataset_id}", json=payload)
+
+        if response.status_code == 200:
+            logger.debug(f"更新数据集列信息成功: {dataset_id}")
+            return True
+        else:
+            logger.warning(f"更新数据集列信息失败: {response.status_code}, 响应: {response.text[:200]}")
+            return False
 
     # ==================== User API ====================
 
